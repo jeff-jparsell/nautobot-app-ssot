@@ -96,7 +96,22 @@ class Device(DiffSyncModel):
     tenant: Optional[str] = None
     controller_group: str
     ports: Optional[List["Port"]] = []
+    virtual_chassis: Optional[str] = None
     metadata: Optional[bool] = True
+
+    uuid: Optional[UUID] = None
+
+class VirtualChassis(DiffSyncModel):
+    """Diffsync model for VirtualChassis."""
+
+    _modelname = "virtualchassis"
+    _identifiers = ("name", "master")
+    _attributes = ("domain",)
+    _children = {}
+
+    name: str
+    master: str
+    domain: Optional[str] = None
 
     uuid: Optional[UUID] = None
 

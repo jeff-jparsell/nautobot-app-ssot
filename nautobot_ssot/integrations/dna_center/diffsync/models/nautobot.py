@@ -345,7 +345,9 @@ class NautobotDevice(base.Device):
         self.adapter.objects_to_delete["devices"].append(dev)
         return self
 
-
+class NautobotViretualChasses(base.VirtualChassis):
+    """Nautobot implementation of VirtualChasses DiffSync model."""
+    
 class NautobotPort(base.Port):
     """Nautobot implementation of Port DiffSync model."""
 
