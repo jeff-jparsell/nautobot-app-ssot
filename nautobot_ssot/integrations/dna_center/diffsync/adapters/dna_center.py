@@ -343,7 +343,7 @@ class DnaCenterAdapter(Adapter):
             self.job.logger.warning(
                 f"Unable to find {self.job.building_loctype.name} {bldg_name} for {self.job.floor_loctype.name} {floor_name}. {err}"
             )
-    
+
     def load_virtual_chassis(self, *args):
         """Load VirtualChassis device from DNA Center."""
 
@@ -351,9 +351,13 @@ class DnaCenterAdapter(Adapter):
         """Load Device data from DNA Center info DiffSync models."""
         devices = self.conn.get_devices()
         for dev in devices:
+            deviceCount = 1
             dev_role = "Unknown"
             vendor = "Cisco"
             platform = self.get_device_platform(dev)
+            deviceCount += platform.count(
+                ","
+            )  ## Assume every device is a stack until proven otherwise? Would allow for most simplistic code
             if not PLUGIN_CFG.get("dna_center_import_merakis") and platform == "cisco_meraki":
                 continue
             if platform == "unknown":
@@ -415,6 +419,8 @@ class DnaCenterAdapter(Adapter):
             if dev.get("serial").split(",") > 1:
                 self.load_virtual_chassis()
                 continue
+            # Hook into this, if I > 1 then call dnac stack_details, utilize s/n from there to append M{I}.
+            # Master should get all stack unique interfaces, otherwise interfaces get associated with their stack
             try:
                 if self.job.debug:
                     self.job.logger.info(
