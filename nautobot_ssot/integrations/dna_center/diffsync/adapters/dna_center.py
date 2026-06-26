@@ -355,9 +355,10 @@ class DnaCenterAdapter(Adapter):
             dev_role = "Unknown"
             vendor = "Cisco"
             platform = self.get_device_platform(dev)
-            deviceCount += platform.count(
-                ","
-            )  ## Assume every device is a stack until proven otherwise? Would allow for most simplistic code
+            ## Device count for managing stacks
+            deviceCount += platform.count(",")
+            if deviceCount > 1:
+                stackDetails = self.conn.get_stack_detail(dev["id"])
             if not PLUGIN_CFG.get("dna_center_import_merakis") and platform == "cisco_meraki":
                 continue
             if platform == "unknown":
@@ -421,63 +422,72 @@ class DnaCenterAdapter(Adapter):
                 continue
             # Hook into this, if I > 1 then call dnac stack_details, utilize s/n from there to append M{I}.
             # Master should get all stack unique interfaces, otherwise interfaces get associated with their stack
-            try:
-                if self.job.debug:
-                    self.job.logger.info(
-                        f"Loading device {dev['hostname'] if dev.get('hostname') else dev['id']}. {dev}"
-                    )
-                device_found = self.get(self.device, dev["hostname"])
-                if device_found:
-                    if self.job.debug:
-                        self.job.logger.warning(
-                            f"Duplicate device attempting to be loaded for {dev['hostname']} with ID: {dev['id']} so will not be imported."
-                        )
-                    dev["field_validation"] = {
-                        "reason": "Failed due to duplicate device found.",
-                        "device_details": dev_details,
-                        "location_data": loc_data,
-                    }
-                    self.failed_import_devices.append(dev)
-                    continue
-            except ObjectNotFound:
-                location_ids = dev_details["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
-                floor_name = None
-                if loc_data.get("floor"):
-                    floor_name = self.dnac_location_map[location_ids[-1]]["name"]
-                    if loc_data["building"] not in loc_data["floor"]:
-                        bldg_name = self.dnac_location_map[location_ids[-1]]["parent"]
-                        floor_name = f"{bldg_name} - {floor_name}"
-                    location_ids.pop(-1)
-                building_name = self.dnac_location_map[location_ids[-1]]["name"]
-                area_name = self.dnac_location_map[location_ids[-1]]["parent"]
-                new_dev = self.device(
-                    name=dev["hostname"],
-                    status="Active" if dev.get("reachabilityStatus") != "Unreachable" else "Offline",
-                    role=dev_role,
-                    vendor=vendor,
-                    model=self.conn.get_model_name(models=dev["platformId"]) if dev.get("platformId") else "Unknown",
-                    area=area_name,
-                    site=building_name,
-                    floor=floor_name,
-                    serial=dev["serialNumber"] if dev.get("serialNumber") else "",
-                    version=dev.get("softwareVersion"),
-                    platform=platform,
-                    tenant=self.tenant.name if self.tenant else None,
-                    controller_group=self.job.controller_group.name,
-                    uuid=None,
-                )
+            for i in range(deviceCount):
+                if deviceCount > 1:
+                    dHostname = dev["hostname"] + f":M{i+1}" if dev.get("hostname") else dev["id"] + f":M{i+1}"
+                    dSerialNumber = stackDetails["stackSwitchInfo"][i]["serialNumber"]
+                    dPlatform = stackDetails["stackSwitchInfo"][i]["platformId"]
+                else:
+                    dHostname = dev["hostname"] if dev.get("hostname") else dev["id"]
+                    dSerialNumber = dev.get("serialNumber", "")
+                    dPlatform = dev.get("platformId", "")
                 try:
-                    self.add(new_dev)
-                    self.load_ports(device_id=dev["id"], dev=new_dev, mgmt_addr=dev["managementIpAddress"])
-                except ValidationError as err:
                     if self.job.debug:
-                        self.job.logger.warning(f"Unable to load device {dev['hostname']}. {err}")
-                    dev["field_validation"] = {
-                        "reason": f"Failed validation. {err}",
-                        "device_details": dev_details,
-                        "location_data": loc_data,
-                    }
-                    self.failed_import_devices.append(dev)
+                        self.job.logger.info(f"Loading device {dHostname}. {dev}")
+                    device_found = self.get(self.device, dHostname)
+                    if device_found:
+                        if self.job.debug:
+                            self.job.logger.warning(
+                                f"Duplicate device attempting to be loaded for {dHostname} with ID: {dev['id']} so will not be imported."
+                            )
+                        dev["field_validation"] = {
+                            "reason": "Failed due to duplicate device found.",
+                            "device_details": dev_details,
+                            "location_data": loc_data,
+                        }
+                        self.failed_import_devices.append(dev)
+                        continue
+                except ObjectNotFound:
+                    location_ids = dev_details["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
+                    floor_name = None
+                    if loc_data.get("floor"):
+                        floor_name = self.dnac_location_map[location_ids[-1]]["name"]
+                        if loc_data["building"] not in loc_data["floor"]:
+                            bldg_name = self.dnac_location_map[location_ids[-1]]["parent"]
+                            floor_name = f"{bldg_name} - {floor_name}"
+                        location_ids.pop(-1)
+                    building_name = self.dnac_location_map[location_ids[-1]]["name"]
+                    area_name = self.dnac_location_map[location_ids[-1]]["parent"]
+                    new_dev = self.device(
+                        name=dHostname,
+                        status="Active" if dev.get("reachabilityStatus") != "Unreachable" else "Offline",
+                        role=dev_role,
+                        vendor=vendor,
+                        model=self.conn.get_model_name(models=dev["platformId"])
+                        if dev.get("platformId")
+                        else "Unknown",
+                        area=area_name,
+                        site=building_name,
+                        floor=floor_name,
+                        serial=dSerialNumber,
+                        version=dev.get("softwareVersion"),
+                        platform=platform,  ## TODO: change -- this is stinky because I may need to re-run get_device_platform
+                        tenant=self.tenant.name if self.tenant else None,
+                        controller_group=self.job.controller_group.name,
+                        uuid=None,
+                    )
+                    try:
+                        self.add(new_dev)
+                        self.load_ports(device_id=dev["id"], dev=new_dev, mgmt_addr=dev["managementIpAddress"])
+                    except ValidationError as err:
+                        if self.job.debug:
+                            self.job.logger.warning(f"Unable to load device {dev['hostname']}. {err}")
+                        dev["field_validation"] = {
+                            "reason": f"Failed validation. {err}",
+                            "device_details": dev_details,
+                            "location_data": loc_data,
+                        }
+                        self.failed_import_devices.append(dev)
 
     def load_device_location_tree(self, dev_details: dict, loc_data: dict):
         """Load Device locations into DiffSync models for Floor, Building, and Areas.

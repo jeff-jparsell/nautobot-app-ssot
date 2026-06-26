@@ -115,6 +115,22 @@ class DnaCenterClient:
             LOGGER.error("Unable to get device detail information from DNA Center. %s", err)
         return dev_detail
 
+    def get_stack_detail(self, dev_id: str):
+        """Retrieve stack information about Device from DNA Center.
+
+        Args:
+            dev_id (str): ID of device in DNAC to query for details.
+
+        Returns:
+            dict: Stack information about dev_id.
+        """
+        dev_stack = {}
+        try:  ## Need to verify the DNACenterSDK Call args and method name
+            dev_stack = self.conn.devices.get_stack_details(device_uuid=dev_id)["response"]
+        except dnacentersdkException as err:
+            LOGGER.error("Unable to get stack detail information from DNA Center. %s", err)
+        return dev_stack
+
     @staticmethod
     def parse_site_hierarchy(location_map: dict, site_hier: str):
         """Parse siteHierarchyGraphId attribute from get_device_detail response.
