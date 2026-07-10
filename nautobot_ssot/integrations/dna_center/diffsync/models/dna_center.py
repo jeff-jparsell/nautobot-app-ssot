@@ -9,6 +9,7 @@ from nautobot_ssot.integrations.dna_center.diffsync.models.base import (
     IPAddressOnInterface,
     Port,
     Prefix,
+    VirtualChassis,
 )
 
 
@@ -77,6 +78,23 @@ class DnaCenterDevice(Device):
 
     def delete(self):
         """Delete Device in DNA Center from Device object."""
+        return self
+
+
+class DnaVirtualChassis(VirtualChassis):
+    """DNA Center implementation of VirtualChassis DiffSync model."""
+
+    @classmethod
+    def create(cls, adapter, ids, attrs):
+        """Create VirtualChassis in DNA Center fromVirtualChassis object."""
+        return super().create(adapter=adapter, ids=ids, attrs=attrs)
+
+    def update(self, attrs):
+        """Update VirtualChassis in DNA Center from VirtualChassis object."""
+        return super().update(attrs)
+
+    def delete(self):
+        """Delete VirtualChassis in DNA Center from VirtualChassis object."""
         return self
 
 

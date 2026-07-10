@@ -33,6 +33,7 @@ from nautobot_ssot.integrations.dna_center.diffsync.models.nautobot import (
     NautobotIPAddressOnInterface,
     NautobotPort,
     NautobotPrefix,
+    NautobotVirtualChassis,
 )
 from nautobot_ssot.integrations.metadata_utils import object_has_metadata
 
@@ -48,8 +49,9 @@ class NautobotAdapter(Adapter):
     prefix = NautobotPrefix
     ipaddress = NautobotIPAddress
     ip_on_intf = NautobotIPAddressOnInterface
+    virtual_chassis = NautobotVirtualChassis
 
-    top_level = ["area", "building", "device", "prefix", "ipaddress", "ip_on_intf"]
+    top_level = ["area", "building", "virtual_chassis", "device", "prefix", "ipaddress", "ip_on_intf"]
 
     tenant_map = {}
     status_map = {}
@@ -170,6 +172,37 @@ class NautobotAdapter(Adapter):
                     f"Unable to load {self.job.building_loctype.name} {floor.parent.name} for {self.job.floor_loctype.name} {floor.name}. {err}"
                 )
 
+    def load_virtual_chassis(self, device):
+        """Add Nautobot Virtual Chassis objects as DiffSync."""
+        onboarding_vc = self.virtual_chassis(
+            name=device.virtual_chassis.name,
+            master__name=device.virtual_chassis.master.name if device.virtual_chassis.master_id else "",
+        )
+        for vc_member in device.virtual_chassis.members.all().exclude(
+            id=device.id
+        ):  # The originating device is loaded in load_devices
+            onboarding_device = self.device(
+                adapter=self,
+                model=vc_member.device_type.model,
+                location=vc_member.location.name,
+                name=vc_member.name,
+                platform=vc_member.platform.name if vc_member.platform_id else "",
+                # TODO: Figure out primary IP using other model
+                role=vc_member.role.name,
+                statu=vc_member.status.name,
+                # TODO: Figure out primary IP using other model
+                serial=vc_member.serial,
+                virtual_chassis__name=vc_member.virtual_chassis.name,
+                vc_position=vc_member.vc_position,
+                vc_priority=vc_member.vc_priority,
+            )
+            self.add(onboarding_device)
+            if self.job.debug:
+                self.job.logger.debug(f"Device: {vc_member.name} loaded.")
+        self.add(onboarding_vc)
+        if self.job.debug:
+            self.job.logger.debug(f"Virtual Chassis: {onboarding_vc.name} loaded.")
+
     def load_devices(self):
         """Load Device data from Nautobot into DiffSync models."""
         if self.tenant:
@@ -177,6 +210,9 @@ class NautobotAdapter(Adapter):
         else:
             devices = OrmDevice.objects.filter(_custom_field_data__system_of_record="DNA Center")
         for dev in devices:
+            if dev.virtual_chassis_id:
+                # TODO: How do I ensure no duplicate loading of chassis members that have already been loaded.
+                self.load_virtual_chassis(dev)
             self.device_map[dev.name] = dev.id
             version = None
             if getattr(dev, "software_version"):

@@ -22,6 +22,7 @@ from nautobot_ssot.integrations.dna_center.diffsync.models.dna_center import (
     DnaCenterIPAddressonInterface,
     DnaCenterPort,
     DnaCenterPrefix,
+    DnaVirtualChassis,
 )
 from nautobot_ssot.integrations.dna_center.utils.dna_center import DnaCenterClient
 from nautobot_ssot.utils import parse_hostname_for_role
@@ -38,8 +39,9 @@ class DnaCenterAdapter(Adapter):
     prefix = DnaCenterPrefix
     ipaddress = DnaCenterIPAddress
     ip_on_intf = DnaCenterIPAddressonInterface
+    virtual_chassis = DnaVirtualChassis
 
-    top_level = ["area", "building", "device", "prefix", "ipaddress", "ip_on_intf"]
+    top_level = ["area", "building", "virtual_chassis", "device", "prefix", "ipaddress", "ip_on_intf"]
 
     def __init__(self, *args, job, sync=None, client: DnaCenterClient, tenant: Tenant, **kwargs):
         """Initialize DNA Center.
@@ -424,7 +426,7 @@ class DnaCenterAdapter(Adapter):
             # Master should get all stack unique interfaces, otherwise interfaces get associated with their stack
             for i in range(deviceCount):
                 if deviceCount > 1:
-                    dHostname = dev["hostname"] + f":M{i+1}" if dev.get("hostname") else dev["id"] + f":M{i+1}"
+                    dHostname = dev["hostname"] + f":M{i + 1}" if dev.get("hostname") else dev["id"] + f":M{i + 1}"
                     dSerialNumber = stackDetails["stackSwitchInfo"][i]["serialNumber"]
                     dPlatform = stackDetails["stackSwitchInfo"][i]["platformId"]
                 else:

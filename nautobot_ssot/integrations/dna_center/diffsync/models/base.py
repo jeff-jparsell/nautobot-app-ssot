@@ -79,6 +79,9 @@ class Device(DiffSyncModel):
         "tenant",
         "controller_group",
         "metadata",
+        "virtual_chassis__name",
+        "vc_position",
+        "vc_priority",
     )
     _children = {"port": "ports"}
 
@@ -98,20 +101,23 @@ class Device(DiffSyncModel):
     ports: Optional[List["Port"]] = []
     virtual_chassis: Optional[str] = None
     metadata: Optional[bool] = True
+    virtual_chassis__name: Optional[str] = None
+    vc_position: Optional[int] = None
+    vc_priority: Optional[int] = None
 
     uuid: Optional[UUID] = None
+
 
 class VirtualChassis(DiffSyncModel):
     """Diffsync model for VirtualChassis."""
 
     _modelname = "virtualchassis"
-    _identifiers = ("name", "master")
-    _attributes = ("domain",)
+    _identifiers = ("name",)
+    _attributes = ("master__name",)
     _children = {}
 
     name: str
-    master: str
-    domain: Optional[str] = None
+    master__name: Optional[str] = None
 
     uuid: Optional[UUID] = None
 

@@ -13,6 +13,7 @@ from nautobot.dcim.models import (
     Manufacturer,
     SoftwareImageFile,
     SoftwareVersion,
+    VirtualChassis,
 )
 from nautobot.extras.models import Role
 from nautobot.extras.models.metadata import ObjectMetadata  # noqa: F401
@@ -345,9 +346,18 @@ class NautobotDevice(base.Device):
         self.adapter.objects_to_delete["devices"].append(dev)
         return self
 
-class NautobotViretualChasses(base.VirtualChassis):
-    """Nautobot implementation of VirtualChasses DiffSync model."""
-    
+
+class NautobotVirtualChassis(base.VirtualChassis):
+    """Nautobot implementation of VirtualChassis DiffSync model."""
+
+    @classmethod
+    def create(cls, adapter, ids, attrs):
+        """Create a VirtualChassis without a master - master is set by device creation."""
+        VirtualChassis.objects.get_or_create(name=ids["name"])
+        # Master will be set by SyncDevicesDevice.create() when the master device is created
+        return super().create(adapter, ids, attrs)
+
+
 class NautobotPort(base.Port):
     """Nautobot implementation of Port DiffSync model."""
 
