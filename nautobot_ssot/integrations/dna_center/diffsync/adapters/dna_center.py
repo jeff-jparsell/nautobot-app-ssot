@@ -418,10 +418,6 @@ class DnaCenterAdapter(Adapter):
                 self.failed_import_devices.append(dev)
                 continue
             self.load_device_location_tree(dev_details, loc_data)
-            # "FJC26161T39, FJC261718MR, FOC2634Y7RL, FOC2634Y7RX, FOC2634Y752, FJC26161SUV"
-            if dev.get("serial").split(",") > 1:
-                self.load_virtual_chassis()
-                continue
             # Hook into this, if I > 1 then call dnac stack_details, utilize s/n from there to append M{I}.
             # Master should get all stack unique interfaces, otherwise interfaces get associated with their stack
             for i in range(deviceCount):
