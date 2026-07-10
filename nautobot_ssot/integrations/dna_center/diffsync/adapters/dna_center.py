@@ -361,6 +361,7 @@ class DnaCenterAdapter(Adapter):
             deviceCount += platform.count(",")
             if deviceCount > 1:
                 stackDetails = self.conn.get_stack_detail(dev["id"])
+                load_virtual_chassis()  ## Chassis names will be the non-member suffixed hostname
             if not PLUGIN_CFG.get("dna_center_import_merakis") and platform == "cisco_meraki":
                 continue
             if platform == "unknown":
