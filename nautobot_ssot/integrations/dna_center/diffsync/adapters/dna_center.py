@@ -34,6 +34,7 @@ class DnaCenterAdapter(Adapter):
     area = DnaCenterArea
     building = DnaCenterBuilding
     floor = DnaCenterFloor
+    chassis = DnaVirtualChassis
     device = DnaCenterDevice
     port = DnaCenterPort
     prefix = DnaCenterPrefix
@@ -346,147 +347,175 @@ class DnaCenterAdapter(Adapter):
                 f"Unable to find {self.job.building_loctype.name} {bldg_name} for {self.job.floor_loctype.name} {floor_name}. {err}"
             )
 
-    def load_virtual_chassis(self, *args):
+    def load_virtual_chassis(self, hostname: str):
         """Load VirtualChassis device from DNA Center."""
+        try:
+            if self.job.debug:
+                self.job.logger.info(f"Loading VirtualChassis {hostname}")
+            virtualChassis = self.get(self.chassis, hostname) ## Where does self.x come from here?
+            if virtualChassis:
+                if self.job.debug:
+                    self.job.logger.warning(
+                        f"Duplicate VirtualChassis attempting to be loaded for {hostname}, so it will not be imported."
+                    )
+                return
+        except:
+            newChassis = self.virtual_chassis(
+                name=hostname,
+                master__name=hostname + ":M1"
+            )
+            try:
+                self.add(newChassis)
+            except ValidationError as err:
+                if self.job.debug:
+                    self.job.logger.warning(f"Unable to load device {hostname}. {err}")
+                newChassis["field_validation"] = {
+                    "reason": f"Failed validation. {err}",
+                }
+                self.failed_import_devices.append(newChassis)
+        return
 
     def load_devices(self):
-        """Load Device data from DNA Center info DiffSync models."""
+        """Load Device  data from DNA Center into DIFFSync models"""
         devices = self.conn.get_devices()
-        for dev in devices:
-            deviceCount = 1
-            dev_role = "Unknown"
-            vendor = "Cisco"
-            platform = self.get_device_platform(dev)
-            ## Device count for managing stacks
-            deviceCount += platform.count(",")
-            if deviceCount > 1:
-                stackDetails = self.conn.get_stack_detail(dev["id"])
-                load_virtual_chassis()  ## Chassis names will be the non-member suffixed hostname
-            if not PLUGIN_CFG.get("dna_center_import_merakis") and platform == "cisco_meraki":
-                continue
-            if platform == "unknown":
-                self.job.logger.warning(f"Device {dev['hostname']} is missing Platform so will be skipped.")
-                dev["field_validation"] = {
-                    "reason": "Failed due to missing platform.",
-                }
-                self.failed_import_devices.append(dev)
-                continue
-            if not dev.get("hostname"):
+
+        for device in devices:
+            # We should have hostname
+            if not device["hostname"]:
                 if self.job.debug:
-                    self.job.logger.warning(f"Device {dev['id']} is missing hostname so will be skipped.")
-                dev["field_validation"] = {
-                    "reason": "Failed due to missing hostname.",
-                }
-                self.failed_import_devices.append(dev)
+                    self.job.logger.warning(f"Device {device['id']} is missing a hostname, and will be skipped")
+                device["field_validation"] = {"reason": "Failed due to missing hostname"}
+                self.failed_import_devices.append(device)
                 continue
-            if dev.get("type") and "Juniper" in dev["type"]:
-                vendor = "Juniper"
-            dev_role = self.get_device_role(dev)
-            dev_details = self.conn.get_device_detail(dev_id=dev["id"])
-            loc_data = {}
-            if dev_details and dev_details.get("siteHierarchyGraphId"):
-                locations = dev_details["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
-                # remove Global if not importing Global
-                if not settings.PLUGINS_CONFIG["nautobot_ssot"].get("dna_center_import_global"):
-                    locations.pop(0)
-                loc_found = [loc in self.dnac_location_map for loc in locations]
-                if not all(loc_found):
-                    self.job.logger.error(
-                        f"Device {dev['hostname']} has unknown location in hierarchy so will not be imported."
-                    )
-                    dev["field_validation"] = {
-                        "reason": "Invalid location information found.",
-                        "device_details": dev_details,
-                        "location_data": loc_data,
-                    }
-                    self.failed_import_devices.append(dev)
-                    continue
-                loc_data = self.conn.parse_site_hierarchy(
-                    location_map=self.dnac_location_map, site_hier=dev_details["siteHierarchyGraphId"]
+
+            # Meraki check
+            if "meraki" in device["family"] and not PLUGIN_CFG.get("dna_center_import_merakis"):
+                continue
+
+            deviceDetails = self.conn.get_device_detail(dev_id=device["id"])
+
+            locations_data = {}
+            # Location Information
+            locations = deviceDetails["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
+            # Remove global if configured
+            if not settings.PLUGINS_CONFIG.get("dna_center_import_global"):
+                locations.pop(0)
+            # Ensure that we have a nautobot equilivent for each location
+            if not all([location in self.dnac_location_map for location in locations]):
+                self.job.logger.error(
+                    f"Device {device['hostname']} has unknown location in hierarchy so will not be imported."
                 )
-            if (
-                (dev_details and not dev_details.get("siteHierarchyGraphId"))
-                or loc_data.get("building") == "Unassigned"
-                or not loc_data.get("building")
-            ):
-                if self.job.debug:
-                    self.job.logger.warning(f"Device {dev['hostname']} is missing building so will not be imported.")
-                dev["field_validation"] = {
-                    "reason": "Missing building assignment.",
-                    "device_details": dev_details,
-                    "location_data": loc_data,
+                device["field_validation"] = {
+                    "reason": "Invalid location information found.",
+                    "device_details": deviceDetails,
+                    "location_data": locations_data,
                 }
-                self.failed_import_devices.append(dev)
+                self.failed_import_devices.append(device)
                 continue
-            self.load_device_location_tree(dev_details, loc_data)
-            # Hook into this, if I > 1 then call dnac stack_details, utilize s/n from there to append M{I}.
-            # Master should get all stack unique interfaces, otherwise interfaces get associated with their stack
+            locations_data = self.conn.parse_site_hierarchy(
+                location_map=self.dnac_location_map,
+                site_hier=deviceDetails["siteHierarchyGraphId"]
+            )
+            if not locations_data.get("building") or locations_data.get("building") == "Unassigned":
+                if self.job.debug:
+                    self.job.logger.warning(f"Device {device['hostname']} is missing building so will not be imported.")
+                device["field_validation"] = {
+                    "reason": "Missing building assignment.",
+                    "device_details": deviceDetails,
+                    "location_data": locations_data,
+                }
+                self.failed_import_devices.append(device)
+                continue
+            self.load_device_location_tree(deviceDetails, locations_data)
+
+            # Patch up device information
+            deviceRole = self.get_device_role(device["role"])
+            deviceVendor = "Juniper" if "Juniper" in device["type"] else "Cisco"
+            deviceStatus = "Active" if device["reachabilityStatus"] != "Unreachable" else "Offline"
+
+            # Determine if single device or stack
+            deviceCount = (device["platformId"].count(",") + 1)
+            if deviceCount > 1:
+                stackDetails = self.conn.get_stack_detail(device["id"])
+                chassis = self.load_virtual_chassis(device["hostname"])
+
             for i in range(deviceCount):
-                if deviceCount > 1:
-                    dHostname = dev["hostname"] + f":M{i + 1}" if dev.get("hostname") else dev["id"] + f":M{i + 1}"
-                    dSerialNumber = stackDetails["stackSwitchInfo"][i]["serialNumber"]
-                    dPlatform = stackDetails["stackSwitchInfo"][i]["platformId"]
+                if deviceCount > 1 and stackDetails:
+                    deviceHostname = device["hostname"] + f":M{i+stackDetails["stackSwitchInfo"][i]["stackMemberNumber"]}"
+                    deviceSerial = stackDetails["stackSwitchInfo"][i]["serialNumber"]
+                    deviceModel = stackDetails["stackSwitchInfo"][i]["platformId"]
+                    devicePlatform = self.get_device_platform(stackDetails["stackSwitchInfo"][i]["platformId"])
+                    deviceChassis = device["hostname"]
+                    deviceChassisPosition = stackDetails["stackSwitchInfo"][i]["stackMemberNumber"]
+                    deviceChassisPriority = stackDetails["stackSwitchInfo"][i]["switchPriority"]
                 else:
-                    dHostname = dev["hostname"] if dev.get("hostname") else dev["id"]
-                    dSerialNumber = dev.get("serialNumber", "")
-                    dPlatform = dev.get("platformId", "")
-                try:
+                    deviceHostname = device["hostname"]
+                    deviceSerial = device["serialNumber"]
+                    deviceModel = device["platformId"]
+                    devicePlatform = self.get_device_platform(device["platformId"])
+                    deviceChassis = None
+                    deviceChassisPosition = None
+                    deviceChassisPriority = None
+
+                location_ids = deviceDetails["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
+                floor_name = None
+                if locations_data.get("floor"):
+                    floor_name = self.dnac_location_map[location_ids[-1]]["name"]
+                    if locations_data["building"] not in locations_data["floor"]:
+                        bldg_name = self.dnac_location_map[location_ids[-1]]["parent"]
+                        floor_name = f"{bldg_name} - {floor_name}"
+                    location_ids.pop(-1)
+                building_name = self.dnac_location_map[location_ids[-1]]["name"]
+                area_name = self.dnac_location_map[location_ids[-1]]["parent"]
+
+                try: # Try to load the device
                     if self.job.debug:
-                        self.job.logger.info(f"Loading device {dHostname}. {dev}")
-                    device_found = self.get(self.device, dHostname)
+                        self.job.logger.info(f"Loading device {deviceHostname}. {device}")
+                    device_found = self.get(self.device, deviceHostname)
                     if device_found:
                         if self.job.debug:
                             self.job.logger.warning(
-                                f"Duplicate device attempting to be loaded for {dHostname} with ID: {dev['id']} so will not be imported."
+                                f"Duplicate device attempting to be loaded for {deviceHostname} with ID: {device['id']} so will not be imported."
                             )
-                        dev["field_validation"] = {
+                        device["field_validation"] = {
                             "reason": "Failed due to duplicate device found.",
-                            "device_details": dev_details,
-                            "location_data": loc_data,
+                            "device_details": deviceDetails,
+                            "location_data": locations_data,
                         }
-                        self.failed_import_devices.append(dev)
+                        self.failed_import_devices.append(device)
                         continue
-                except ObjectNotFound:
-                    location_ids = dev_details["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
-                    floor_name = None
-                    if loc_data.get("floor"):
-                        floor_name = self.dnac_location_map[location_ids[-1]]["name"]
-                        if loc_data["building"] not in loc_data["floor"]:
-                            bldg_name = self.dnac_location_map[location_ids[-1]]["parent"]
-                            floor_name = f"{bldg_name} - {floor_name}"
-                        location_ids.pop(-1)
-                    building_name = self.dnac_location_map[location_ids[-1]]["name"]
-                    area_name = self.dnac_location_map[location_ids[-1]]["parent"]
-                    new_dev = self.device(
-                        name=dHostname,
-                        status="Active" if dev.get("reachabilityStatus") != "Unreachable" else "Offline",
-                        role=dev_role,
-                        vendor=vendor,
-                        model=self.conn.get_model_name(models=dev["platformId"])
-                        if dev.get("platformId")
-                        else "Unknown",
+                except: # If it doesn't exist, then add it to the array
+                    newDevice = self.device(
+                        name=deviceHostname,
+                        status=deviceStatus,
+                        role=deviceRole,
+                        vendor=deviceVendor,
+                        model=deviceModel,
                         area=area_name,
                         site=building_name,
                         floor=floor_name,
-                        serial=dSerialNumber,
-                        version=dev.get("softwareVersion"),
-                        platform=platform,  ## TODO: change -- this is stinky because I may need to re-run get_device_platform
+                        serial=deviceSerial,
+                        version=device["softwareVersion"],
+                        platform=devicePlatform,
                         tenant=self.tenant.name if self.tenant else None,
                         controller_group=self.job.controller_group.name,
-                        uuid=None,
+                        uuid=device["id"],
+                        virtual_chassis__name = deviceChassis,
+                        vc_position = deviceChassisPosition,
+                        vc_priority = deviceChassisPriority
                     )
                     try:
-                        self.add(new_dev)
-                        self.load_ports(device_id=dev["id"], dev=new_dev, mgmt_addr=dev["managementIpAddress"])
+                        self.add(newDevice)
+                        self.load_ports(device_id=device["id"], dev=newDevice, mgmt_addr=device["managementIpAddress"])
                     except ValidationError as err:
                         if self.job.debug:
-                            self.job.logger.warning(f"Unable to load device {dev['hostname']}. {err}")
-                        dev["field_validation"] = {
+                            self.job.logger.warning(f"Unable to load device {device['hostname']}. {err}")
+                        device["field_validation"] = {
                             "reason": f"Failed validation. {err}",
-                            "device_details": dev_details,
-                            "location_data": loc_data,
+                            "device_details": deviceDetails,
+                            "location_data": locations_data,
                         }
-                        self.failed_import_devices.append(dev)
+                        self.failed_import_devices.append(device)
 
     def load_device_location_tree(self, dev_details: dict, loc_data: dict):
         """Load Device locations into DiffSync models for Floor, Building, and Areas.
@@ -544,7 +573,7 @@ class DnaCenterAdapter(Adapter):
             dev_role = dev["role"]
         return dev_role
 
-    def get_device_platform(self, dev):
+    def get_device_platform(self, device):
         """Get Device Platform from Job information.
 
         Args:
@@ -553,28 +582,22 @@ class DnaCenterAdapter(Adapter):
         Returns:
             str: Device platform that has been determined from DNA Center information.
         """
-        platform = "unknown"
-        if dev["softwareType"] in DNA_CENTER_LIB_MAPPER:
-            platform = DNA_CENTER_LIB_MAPPER[dev["softwareType"]]
+        if device["softwareType"] in DNA_CENTER_LIB_MAPPER: # Try to map reported softwareType to known software
+            return DNA_CENTER_LIB_MAPPER["softwareType"]
+        elif not device["softwareType"] and device["family"] == "Unified AP":
+            # Cisco sucks and doesn't report softwareType for APs, but
+            # aireos major latest is 8 and EOL, so we can safely determine based on that
+            major_version = int(device["softwareVersion"].split(".")[0])
+            if major_version <= 8:
+                return "cisco_aireos"
+            elif major_version >= 16:
+                return "cisco_ios"
+            else:
+                return "Unknown" # Cisco never made major 9-15 for wireless platforms, so somehow we got here and shouldn't have
+        elif (device.get("family") and "Meraki" in device["family"]) or (device.get("platformId") and device["platformId"].startswith(("MX", "MS", "MR", "Z"))) or (device.get("errorDescription") and "Meraki" in device["errorDescription"]):
+              return "cisco_meraki"
         else:
-            if not dev.get("softwareType") and dev.get("type"):
-                for series in ["2700", "2800", "3800", "9120", "9124", "9130", "9136", "9166", "9115"]:
-                    if series in dev["type"]:
-                        platform = "cisco_ios"
-                        break
-
-                for series in ["8540", "1850", "1562"]:
-                    if series in dev["type"]:
-                        platform = "cisco_aireos"
-                        break
-
-            if (
-                (dev.get("family") and "Meraki" in dev["family"])
-                or (dev.get("platformId") and dev["platformId"].startswith(("MX", "MS", "MR", "Z")))
-                or (dev.get("errorDescription") and "Meraki" in dev["errorDescription"])
-            ):
-                platform = "cisco_meraki"
-        return platform
+            return "Unknown"
 
     def load_ports(self, device_id: str, dev: DnaCenterDevice, mgmt_addr: str = ""):
         """Load port info from DNAC into Port DiffSyncModel.
