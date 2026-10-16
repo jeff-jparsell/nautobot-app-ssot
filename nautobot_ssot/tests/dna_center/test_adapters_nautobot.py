@@ -14,6 +14,7 @@ from nautobot.dcim.models import (
     LocationType,
     Manufacturer,
     Platform,
+    VirtualChassis,
 )
 from nautobot.extras.models import JobResult, Role, Status
 from nautobot.ipam.models import IPAddress, IPAddressToInterface, Namespace, Prefix
@@ -290,6 +291,82 @@ class NautobotDiffSyncTestCase(TransactionTestCase):  # pylint: disable=too-many
             ],
             sorted(ipaddr.get_unique_id() for ipaddr in self.nb_adapter.get_all("ipaddress")),
         )
+
+    def build_virtual_chassis(self):
+        """Build a DNA Center owned VirtualChassis and a VirtualChassis owned by another system in Nautobot."""
+        self.build_nautobot_objects()
+        device_type = DeviceType.objects.get(model="Cisco Catalyst 9300 Switch")
+        leaf_role = Role.objects.get(name="LEAF")
+        ios_platform = Platform.objects.get(name="IOS")
+        stacks = {}
+        for stack_name, system_of_record in [("san-floor1-sw02", "DNA Center"), ("other-stack", "Other")]:
+            stack = VirtualChassis.objects.create(name=stack_name)
+            members = [
+                Device.objects.create(
+                    name=stack_name if position == 1 else f"{stack_name}:{position}",
+                    location=self.floor_loc,
+                    status=self.status_active,
+                    device_type=device_type,
+                    role=leaf_role,
+                    platform=ios_platform,
+                    virtual_chassis=stack,
+                    vc_position=position,
+                    vc_priority=16 - position,
+                    _custom_field_data={"system_of_record": system_of_record},
+                )
+                for position in (1, 2)
+            ]
+            stack.master = members[0]
+            stack.validated_save()
+            stacks[stack_name] = stack
+        return stacks
+
+    def test_load_virtual_chassis(self):
+        """Test the load_virtual_chassis method only loads VirtualChassis with DNA Center owned members."""
+        stacks = self.build_virtual_chassis()
+        self.nb_adapter.load_virtual_chassis()
+        self.nb_adapter.load_devices()
+
+        loaded_vcs = self.nb_adapter.get_all("virtual_chassis")
+        self.assertEqual(["san-floor1-sw02"], [vc.get_unique_id() for vc in loaded_vcs])
+        self.assertEqual(loaded_vcs[0].master, "san-floor1-sw02")
+        self.assertEqual(loaded_vcs[0].uuid, stacks["san-floor1-sw02"].id)
+        self.assertEqual(self.nb_adapter.vc_map["san-floor1-sw02"], stacks["san-floor1-sw02"].id)
+        self.assertNotIn("other-stack", self.nb_adapter.vc_map)
+
+        member = self.nb_adapter.get(self.nb_adapter.device, "san-floor1-sw02:2")
+        self.assertEqual(member.virtual_chassis, "san-floor1-sw02")
+        self.assertEqual(member.vc_position, 2)
+        self.assertEqual(member.vc_priority, 14)
+        standalone = self.nb_adapter.get(self.nb_adapter.device, "spine1.abc.in")
+        self.assertIsNone(standalone.virtual_chassis)
+        self.assertIsNone(standalone.vc_position)
+        with self.assertRaises(ObjectNotFound):
+            self.nb_adapter.get(self.nb_adapter.device, "other-stack:2")
+
+    def test_assign_vc_masters(self):
+        """Test the assign_vc_masters method sets queued VirtualChassis masters and skips unknown Devices."""
+        stack = self.build_virtual_chassis()["san-floor1-sw02"]
+        new_master = Device.objects.get(name="san-floor1-sw02:2")
+        self.nb_adapter.device_map = {"san-floor1-sw02:2": new_master.id}
+        self.nb_adapter.objects_to_create["vc_masters"] = [
+            (stack.id, "san-floor1-sw02:2"),
+            (stack.id, "missing-device"),
+        ]
+
+        self.nb_adapter.assign_vc_masters()
+        stack.refresh_from_db()
+        self.assertEqual(stack.master, new_master)
+        self.nb_adapter.job.logger.warning.assert_called_once_with(
+            "Unable to find Device missing-device to assign as master of VirtualChassis san-floor1-sw02."
+        )
+
+    def test_database_updates_assign_vc_masters(self):
+        """Test both the standard and bulk database update paths assign VirtualChassis masters."""
+        self.nb_adapter.assign_vc_masters = MagicMock()
+        self.nb_adapter.update_database()
+        self.nb_adapter.bulk_create_update()
+        self.assertEqual(self.nb_adapter.assign_vc_masters.call_count, 2)
 
     def test_load_areas_failure(self):
         """Test the load_areas method failing with loading duplicate Areas."""

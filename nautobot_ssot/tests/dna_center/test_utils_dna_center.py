@@ -17,6 +17,8 @@ from nautobot_ssot.tests.dna_center.fixtures import (
     RECV_DEVICE_FIXTURE,
     RECV_LOCATION_FIXTURE,
     RECV_PORT_FIXTURE,
+    RECV_STACK_DETAIL_FIXTURE,
+    STACK_DETAIL_FIXTURE,
 )
 
 
@@ -156,6 +158,23 @@ class TestDnaCenterClient(TestCase):  # pylint: disable=too-many-public-methods
             self.dnac.get_device_detail(dev_id="1234567890")
             self.assertIn("Unable to get device detail information from DNA Center.", log.output[0])
 
+    def test_get_stack_detail(self):
+        """Test the get_stack_detail method in DnaCenterClient."""
+        self.dnac.conn.devices.get_stack_details_for_device.return_value = RECV_STACK_DETAIL_FIXTURE
+        actual = self.dnac.get_stack_detail(dev_id="9f1e9ab8-3f07-4997-98a8-75e4dbb6120c")
+        self.assertEqual(actual, STACK_DETAIL_FIXTURE)
+        self.dnac.conn.devices.get_stack_details_for_device.assert_called_once_with(
+            device_id="9f1e9ab8-3f07-4997-98a8-75e4dbb6120c"
+        )
+
+    def test_get_stack_detail_catches_api_error(self):
+        """Test the get_stack_detail method in DnaCenterClient catches dnacentersdkException."""
+        self.dnac.conn.devices.get_stack_details_for_device.side_effect = dnacentersdkException(self.mock_response)
+        with self.assertLogs(level="ERROR") as log:
+            actual = self.dnac.get_stack_detail(dev_id="1234567890")
+            self.assertIn("Unable to get stack detail information from DNA Center.", log.output[0])
+        self.assertEqual(actual, {})
+
     def test_parse_site_hierarchy(self):
         """Test the parse_site_hierarchy method in DnaCenterClient."""
         mock_location_map = {
@@ -232,3 +251,20 @@ class TestDnaCenterClient(TestCase):  # pylint: disable=too-many-public-methods
         test_models = "CSR1000v, CSR1000v, CSR1000v"
         result = self.dnac.get_model_name(models=test_models)
         self.assertEqual(result, "CSR1000v")
+
+    mock_stack_member_ports = [
+        ("Member 1 access port", "GigabitEthernet1/0/1", 1),
+        ("Member 2 access port", "GigabitEthernet2/0/1", 2),
+        ("Member 6 uplink port", "TenGigabitEthernet6/1/1", 6),
+        ("Application port", "AppGigabitEthernet1/0/1", 1),
+        ("Management port", "GigabitEthernet0/0", None),
+        ("SVI", "Vlan1", None),
+        ("Loopback", "Loopback0", None),
+        ("Port-channel", "Port-channel1", None),
+    ]
+
+    @parameterized.expand(mock_stack_member_ports, skip_on_empty=True)
+    def test_get_stack_member_number(self, name, sent, received):  # pylint: disable=unused-argument
+        """Test the get_stack_member_number method in DnaCenterClient."""
+        actual = self.dnac.get_stack_member_number(port_name=sent)
+        self.assertEqual(actual, received)

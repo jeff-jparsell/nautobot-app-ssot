@@ -1,6 +1,7 @@
 """Test DNA Center adapter."""
 
 import uuid
+from copy import deepcopy
 from unittest.mock import MagicMock
 
 from django.contrib.contenttypes.models import ContentType
@@ -22,6 +23,7 @@ from nautobot.ipam.models import IPAddress, IPAddressToInterface, Namespace, Pre
 
 from nautobot_ssot.integrations.dna_center.diffsync.adapters.dna_center import DnaCenterAdapter
 from nautobot_ssot.integrations.dna_center.jobs import DnaCenterDataSource
+from nautobot_ssot.integrations.dna_center.utils.dna_center import DnaCenterClient
 from nautobot_ssot.tests.dna_center.fixtures import (
     DEVICE_DETAIL_FIXTURE,
     DEVICE_FIXTURE,
@@ -34,8 +36,10 @@ from nautobot_ssot.tests.dna_center.fixtures import (
     LOCATION_FIXTURE,
     MULTI_LEVEL_LOCATION_FIXTURE,
     PORT_FIXTURE,
-    DEVICE_STACK_FIXTURE,
-    DEVICE_STACK_DETAILS_FIXTURE
+    STACK_DETAIL_FIXTURE,
+    STACK_DEVICE_DETAIL_FIXTURE,
+    STACK_DEVICE_FIXTURE,
+    STACK_PORT_FIXTURE,
 )
 
 
@@ -66,6 +70,8 @@ class TestDnaCenterAdapterTestCase(TransactionTestCase):  # pylint: disable=too-
         self.dna_center_client.get_port_info.return_value = PORT_FIXTURE
         self.dna_center_client.get_port_type.return_value = "virtual"
         self.dna_center_client.get_port_status.return_value = "active"
+        self.dna_center_client.get_stack_detail.return_value = STACK_DETAIL_FIXTURE
+        self.dna_center_client.get_stack_member_number.side_effect = DnaCenterClient.get_stack_member_number
 
         sor_cf_dict = {
             "type": CustomFieldTypeChoices.TYPE_TEXT,
@@ -358,6 +364,128 @@ class TestDnaCenterAdapterTestCase(TransactionTestCase):  # pylint: disable=too-
         self.dna_center.build_dnac_location_map(locations=MULTI_LEVEL_LOCATION_FIXTURE)
         self.assertEqual(self.dna_center.dnac_location_map, EXPECTED_DNAC_LOCATION_MAP_W_MULTI_LEVEL_LOCATIONS)
 
+    def _use_stack_fixtures(self):
+        """Point the mocked DNA Center client at the switch stack fixtures."""
+        self.dna_center_client.get_devices.return_value = STACK_DEVICE_FIXTURE
+        self.dna_center_client.get_device_detail.return_value = STACK_DEVICE_DETAIL_FIXTURE
+        self.dna_center_client.get_port_info.return_value = STACK_PORT_FIXTURE
+
     def test_load_virtual_chassis(self):
-        """Test Nautobot adapter load_virtual_chassis() functions."""
-        pass
+        """Test DNA Center adapter loads a switch stack as a VirtualChassis with a Device per stack member."""
+        self._use_stack_fixtures()
+        self.dna_center.load_ports = MagicMock()
+        self.dna_center.load_devices()
+        hostname = STACK_DEVICE_FIXTURE[0]["hostname"]
+
+        loaded_vcs = self.dna_center.get_all("virtual_chassis")
+        self.assertEqual([hostname], [vc.get_unique_id() for vc in loaded_vcs])
+        self.assertEqual(loaded_vcs[0].master, hostname)
+        self.assertEqual(
+            {hostname} | {f"{hostname}:{num}" for num in range(2, 7)},
+            {dev.get_unique_id() for dev in self.dna_center.get_all("device")},
+        )
+        self.dna_center_client.get_stack_detail.assert_called_once_with(dev_id=STACK_DEVICE_FIXTURE[0]["id"])
+
+        master = self.dna_center.get(self.dna_center.device, hostname)
+        for member in STACK_DETAIL_FIXTURE["stackSwitchInfo"]:
+            member_num = member["stackMemberNumber"]
+            dev_name = hostname if member_num == 1 else f"{hostname}:{member_num}"
+            with self.subTest(device=dev_name):
+                dev = self.dna_center.get(self.dna_center.device, dev_name)
+                self.assertEqual(dev.serial, member["serialNumber"])
+                self.assertEqual(dev.model, member["platformId"])
+                self.assertEqual(dev.vc_position, member_num)
+                self.assertEqual(dev.vc_priority, member["switchPriority"])
+                self.assertEqual(dev.virtual_chassis, hostname)
+                self.assertEqual(dev.role, "ACCESS")
+                self.assertEqual(dev.version, "17.15.3")
+                self.assertEqual(
+                    (dev.status, dev.area, dev.site, dev.floor, dev.platform, dev.controller_group),
+                    (master.status, master.area, master.site, master.floor, master.platform, master.controller_group),
+                )
+
+        self.dna_center.load_ports.assert_called_once()
+        load_ports_kwargs = self.dna_center.load_ports.call_args.kwargs
+        self.assertEqual(load_ports_kwargs["device_id"], STACK_DEVICE_FIXTURE[0]["id"])
+        self.assertEqual(load_ports_kwargs["dev"].name, hostname)
+        self.assertEqual(load_ports_kwargs["mgmt_addr"], "10.10.10.1")
+        self.assertEqual(sorted(load_ports_kwargs["stack_members"]), [1, 2, 3, 4, 5, 6])
+
+    def test_load_virtual_chassis_master_follows_active_role(self):
+        """Test the VirtualChassis master follows the ACTIVE member while Device names stay tied to member number."""
+        self._use_stack_fixtures()
+        stack_detail = deepcopy(STACK_DETAIL_FIXTURE)
+        stack_detail["stackSwitchInfo"][0]["role"] = "STANDBY"
+        stack_detail["stackSwitchInfo"][1]["role"] = "ACTIVE"
+        stack_detail["stackSwitchInfo"].reverse()  # ensure members are ordered by member number, not API order
+        self.dna_center_client.get_stack_detail.return_value = stack_detail
+        self.dna_center.load_ports = MagicMock()
+        self.dna_center.load_devices()
+        hostname = STACK_DEVICE_FIXTURE[0]["hostname"]
+
+        loaded_vc = self.dna_center.get(self.dna_center.virtual_chassis, hostname)
+        self.assertEqual(loaded_vc.master, f"{hostname}:2")
+        self.assertEqual(self.dna_center.get(self.dna_center.device, hostname).serial, "6EO52J")
+        self.assertEqual(self.dna_center.get(self.dna_center.device, f"{hostname}:2").serial, "11Z6BW")
+        self.assertEqual(self.dna_center.load_ports.call_args.kwargs["dev"].name, hostname)
+
+    def test_load_virtual_chassis_stack_detail_unavailable(self):
+        """Test a switch stack falls back to a single Device when stack details can't be retrieved."""
+        self._use_stack_fixtures()
+        self.dna_center_client.get_stack_detail.return_value = {}
+        self.dna_center.load_ports = MagicMock()
+        self.dna_center.load_devices()
+        hostname = STACK_DEVICE_FIXTURE[0]["hostname"]
+
+        self.assertEqual(len(self.dna_center.get_all("virtual_chassis")), 0)
+        self.assertEqual([hostname], [dev.get_unique_id() for dev in self.dna_center.get_all("device")])
+        loaded_dev = self.dna_center.get(self.dna_center.device, hostname)
+        self.assertEqual(loaded_dev.serial, STACK_DEVICE_FIXTURE[0]["serialNumber"])
+        self.assertIsNone(loaded_dev.virtual_chassis)
+        self.assertIsNone(loaded_dev.vc_position)
+        self.job.logger.warning.assert_any_call(
+            f"Unable to retrieve stack details for {hostname} so it will be loaded as a single Device."
+        )
+        self.dna_center.load_ports.assert_called_once()
+
+    def test_load_ports_stack(self):
+        """Test DNA Center adapter assigns switch stack ports to the stack member identified in the port name."""
+        self._use_stack_fixtures()
+        self.dna_center.load_devices()
+        hostname = STACK_DEVICE_FIXTURE[0]["hostname"]
+
+        expected_ports = {
+            "GigabitEthernet0/0": hostname,
+            "GigabitEthernet1/0/1": hostname,
+            "GigabitEthernet2/0/1": f"{hostname}:2",
+            "GigabitEthernet3/0/1": f"{hostname}:3",
+            "TenGigabitEthernet6/1/1": f"{hostname}:6",
+            "Port-channel1": hostname,
+            "Loopback0": hostname,
+            "Vlan1": hostname,
+        }
+        self.assertEqual(expected_ports, {port.name: port.device for port in self.dna_center.get_all("port")})
+        self.assertEqual(
+            [f"TenGigabitEthernet6/1/1__{hostname}:6"],
+            self.dna_center.get(self.dna_center.device, f"{hostname}:6").ports,
+        )
+        self.assertEqual([], self.dna_center.get(self.dna_center.device, f"{hostname}:4").ports)
+        self.assertEqual(
+            [("10.10.10.1", hostname, "Vlan1", True)],
+            [
+                (mapping.host, mapping.device, mapping.port, mapping.primary)
+                for mapping in self.dna_center.get_all("ip_on_intf")
+            ],
+        )
+
+    def test_load_devices_non_stack_has_no_virtual_chassis(self):
+        """Test DNA Center adapter doesn't treat non-stacked Devices as a VirtualChassis."""
+        self.dna_center.load_ports = MagicMock()
+        self.dna_center.load_devices()
+        self.assertEqual(len(self.dna_center.get_all("virtual_chassis")), 0)
+        for dev in self.dna_center.get_all("device"):
+            with self.subTest(device=dev.name):
+                self.assertIsNone(dev.virtual_chassis)
+                self.assertIsNone(dev.vc_position)
+                self.assertIsNone(dev.vc_priority)
+        self.dna_center_client.get_stack_detail.assert_not_called()

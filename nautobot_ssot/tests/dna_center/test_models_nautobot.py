@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 from diffsync import Adapter
+from django.contrib.contenttypes.models import ContentType
 from django.test import override_settings
 from nautobot.core.testing import TransactionTestCase
 from nautobot.dcim.models import (
@@ -15,8 +16,10 @@ from nautobot.dcim.models import (
     LocationType,
     Manufacturer,
     Platform,
+    VirtualChassis,
 )
-from nautobot.extras.models import Role, Status
+from nautobot.extras.choices import CustomFieldTypeChoices
+from nautobot.extras.models import CustomField, Role, Status
 from nautobot.ipam.models import IPAddress, Prefix
 from nautobot.tenancy.models import Tenant
 
@@ -26,6 +29,7 @@ from nautobot_ssot.integrations.dna_center.diffsync.models.nautobot import (
     NautobotDevice,
     NautobotFloor,
     NautobotIPAddressOnInterface,
+    NautobotVirtualChassis,
 )
 
 
@@ -355,6 +359,85 @@ class TestNautobotDevice(TransactionTestCase):
         self.assertEqual(new_dev.tenant_id, self.ga_tenant.id)
         self.assertTrue(new_dev.software_version.version, self.attrs["version"])
 
+    def test_create_with_virtual_chassis(self):
+        """Test the NautobotDevice create() method assigns the Device to its VirtualChassis."""
+        self.adapter.site_map = {"NY": {"HQ": self.hq_site.id}}
+        self.attrs["floor"] = None
+        stack = VirtualChassis.objects.create(name="core-stack")
+        self.adapter.vc_map = {"core-stack": stack.id}
+        self.attrs.update({"virtual_chassis": "core-stack", "vc_position": 2, "vc_priority": 14})
+
+        NautobotDevice.create(self.adapter, self.ids, self.attrs)
+        new_dev = self.adapter.objects_to_create["devices"][0]
+        self.assertEqual(new_dev.virtual_chassis_id, stack.id)
+        self.assertEqual(new_dev.vc_position, 2)
+        self.assertEqual(new_dev.vc_priority, 14)
+
+    def _build_existing_device(self, **kwargs):
+        """Create a Device in Nautobot and the matching NautobotDevice DiffSync object for update tests."""
+        self.site_lt.content_types.add(ContentType.objects.get_for_model(Device))
+        role = Role.objects.get_or_create(name="core")[0]
+        role.content_types.add(ContentType.objects.get_for_model(Device))
+        for cf_key, cf_type in [
+            ("system_of_record", CustomFieldTypeChoices.TYPE_TEXT),
+            ("last_synced_from_sor", CustomFieldTypeChoices.TYPE_DATE),
+        ]:
+            custom_field = CustomField.objects.update_or_create(
+                key=cf_key, defaults={"label": cf_key, "type": cf_type}
+            )[0]
+            custom_field.content_types.add(ContentType.objects.get_for_model(Device))
+        existing_dev = Device.objects.create(
+            name=self.ids["name"],
+            status=self.status_active,
+            role=role,
+            location=self.hq_site,
+            device_type=DeviceType.objects.get_or_create(
+                model=self.attrs["model"], manufacturer=Manufacturer.objects.get_or_create(name="Cisco")[0]
+            )[0],
+            platform_id=self.adapter.platform_map["cisco_ios"],
+            serial=self.attrs["serial"],
+            controller_managed_device_group=self.adapter.job.controller_group,
+            **kwargs,
+        )
+        ds_dev = NautobotDevice(
+            name=existing_dev.name,
+            vendor="Cisco",
+            model=self.attrs["model"],
+            area="NY",
+            site="HQ",
+            platform="cisco_ios",
+            controller_group=self.attrs["controller_group"],
+            uuid=existing_dev.id,
+        )
+        ds_dev.adapter = self.adapter
+        return existing_dev, ds_dev
+
+    @patch("nautobot_ssot.integrations.dna_center.diffsync.models.nautobot.add_or_update_metadata_on_object")
+    def test_update_virtual_chassis(self, mock_metadata):  # pylint: disable=unused-argument
+        """Test the NautobotDevice update() method adds an existing Device to a VirtualChassis."""
+        stack = VirtualChassis.objects.create(name="core-stack")
+        self.adapter.vc_map = {"core-stack": stack.id}
+        existing_dev, ds_dev = self._build_existing_device()
+
+        NautobotDevice.update(self=ds_dev, attrs={"virtual_chassis": "core-stack", "vc_position": 1, "vc_priority": 15})
+        existing_dev.refresh_from_db()
+        self.assertEqual(existing_dev.virtual_chassis, stack)
+        self.assertEqual(existing_dev.vc_position, 1)
+        self.assertEqual(existing_dev.vc_priority, 15)
+
+    @patch("nautobot_ssot.integrations.dna_center.diffsync.models.nautobot.add_or_update_metadata_on_object")
+    def test_update_remove_virtual_chassis(self, mock_metadata):  # pylint: disable=unused-argument
+        """Test the NautobotDevice update() method removes a Device from its VirtualChassis."""
+        stack = VirtualChassis.objects.create(name="core-stack")
+        self.adapter.vc_map = {"core-stack": stack.id}
+        existing_dev, ds_dev = self._build_existing_device(virtual_chassis=stack, vc_position=2, vc_priority=14)
+
+        NautobotDevice.update(self=ds_dev, attrs={"virtual_chassis": None, "vc_position": None, "vc_priority": None})
+        existing_dev.refresh_from_db()
+        self.assertIsNone(existing_dev.virtual_chassis)
+        self.assertIsNone(existing_dev.vc_position)
+        self.assertIsNone(existing_dev.vc_priority)
+
 
 class TestNautobotIPAddressOnInterface(TransactionTestCase):
     """Test NautobotIPAddressOnInterface class."""
@@ -435,16 +518,76 @@ class TestNautobotIPAddressOnInterface(TransactionTestCase):
         self.assertEqual(new_map.ip_address.host, ids["host"])
         self.assertEqual(new_map.interface.name, ids["port"])
 
-class TestVirtualChassis(TransactionTestCase):
-    """Test VirtualChassis create, update and delete."""
+
+class TestNautobotVirtualChassis(TransactionTestCase):
+    """Test NautobotVirtualChassis class."""
 
     def setUp(self):
         super().setUp()
 
         self.status_active = Status.objects.get(name="Active")
-        self.site_lt = LocationType.objects.get_or_create(name="Site")[0]
+        site_lt = LocationType.objects.get_or_create(name="Site")[0]
+        hq_site = Location.objects.create(name="HQ", status=self.status_active, location_type=site_lt)
 
         self.adapter = Adapter()
         self.adapter.job = MagicMock()
-        self.adapter.objects_to_create = {"mappings": [], "primary_ip4": []}  # pylint: disable=no-member
-        self.ga_tenant = Tenant.objects.create(name="G&A")
+        self.adapter.job.logger.info = MagicMock()
+        self.adapter.vc_map = {}
+        self.adapter.objects_to_create = {"vc_masters": []}  # pylint: disable=no-member
+
+        device_type = DeviceType.objects.get_or_create(
+            model="C9300-48UXM", manufacturer=Manufacturer.objects.get_or_create(name="Cisco")[0]
+        )[0]
+        access_role = Role.objects.get_or_create(name="ACCESS")[0]
+        self.stack = VirtualChassis.objects.create(name="san-floor1-sw02")
+        self.members = [
+            Device.objects.create(
+                name="san-floor1-sw02" if position == 1 else f"san-floor1-sw02:{position}",
+                status=self.status_active,
+                location=hq_site,
+                device_type=device_type,
+                role=access_role,
+                virtual_chassis=self.stack,
+                vc_position=position,
+                vc_priority=16 - position,
+            )
+            for position in (1, 2)
+        ]
+        self.stack.master = self.members[0]
+        self.stack.validated_save()
+
+        self.ds_stack = NautobotVirtualChassis(name="san-floor1-sw02", master="san-floor1-sw02", uuid=self.stack.id)
+        self.ds_stack.adapter = self.adapter
+
+    def test_create(self):
+        """Test the NautobotVirtualChassis create() method creates a VirtualChassis and queues its master."""
+        ids = {"name": "new-stack"}
+        attrs = {"master": "new-stack"}
+        result = NautobotVirtualChassis.create(self.adapter, ids, attrs)
+        self.assertIsInstance(result, NautobotVirtualChassis)
+        new_vc = VirtualChassis.objects.get(name="new-stack")
+        self.assertIsNone(new_vc.master)
+        self.assertEqual(self.adapter.vc_map["new-stack"], new_vc.id)
+        self.assertEqual(self.adapter.objects_to_create["vc_masters"], [(new_vc.id, "new-stack")])
+
+    def test_create_without_master(self):
+        """Test the NautobotVirtualChassis create() method doesn't queue a master when none is defined."""
+        NautobotVirtualChassis.create(self.adapter, {"name": "new-stack"}, {"master": None})
+        self.assertTrue(VirtualChassis.objects.filter(name="new-stack").exists())
+        self.assertEqual(self.adapter.objects_to_create["vc_masters"], [])
+
+    def test_update_master(self):
+        """Test the NautobotVirtualChassis update() method queues the new master."""
+        result = NautobotVirtualChassis.update(self=self.ds_stack, attrs={"master": "san-floor1-sw02:2"})
+        self.assertEqual(self.adapter.objects_to_create["vc_masters"], [(self.stack.id, "san-floor1-sw02:2")])
+        self.assertEqual(result, self.ds_stack)
+
+    def test_delete(self):
+        """Test the NautobotVirtualChassis delete() method deletes the VirtualChassis and releases its members."""
+        result = NautobotVirtualChassis.delete(self.ds_stack)
+        self.assertFalse(VirtualChassis.objects.filter(id=self.stack.id).exists())
+        for member in self.members:
+            member.refresh_from_db()
+            self.assertIsNone(member.virtual_chassis)
+            self.assertIsNone(member.vc_position)
+        self.assertEqual(result, self.ds_stack)
