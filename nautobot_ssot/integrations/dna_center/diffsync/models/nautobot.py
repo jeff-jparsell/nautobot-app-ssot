@@ -252,6 +252,10 @@ class NautobotDevice(base.Device):
             new_device.location_id = adapter.floor_map[attrs["area"]][attrs["site"]][attrs["floor"]]
         if attrs.get("tenant"):
             new_device.tenant_id = adapter.tenant_map[attrs["tenant"]]
+        if attrs.get("virtual_chassis"):
+            new_device.virtual_chassis_id = adapter.vc_map[attrs["virtual_chassis"]]
+            new_device.vc_position = attrs.get("vc_position")
+            new_device.vc_priority = attrs.get("vc_priority")
         if attrs.get("version"):
             soft_version = SoftwareVersion.objects.get_or_create(
                 version=attrs["version"], platform=platform, defaults={"status_id": adapter.status_map["Active"]}
@@ -318,6 +322,17 @@ class NautobotDevice(base.Device):
                 device.tenant = None
         if "controller_group" in attrs:
             device.controller_managed_device_group = self.adapter.job.controller_group
+        if "virtual_chassis" in attrs:
+            if attrs.get("virtual_chassis"):
+                device.virtual_chassis_id = self.adapter.vc_map[attrs["virtual_chassis"]]
+            else:
+                device.virtual_chassis = None
+                device.vc_position = None
+                device.vc_priority = None
+        if "vc_position" in attrs:
+            device.vc_position = attrs["vc_position"]
+        if "vc_priority" in attrs:
+            device.vc_priority = attrs["vc_priority"]
         if "version" in attrs:
             if attrs.get("platform"):
                 platform = attrs["platform"]
@@ -352,10 +367,42 @@ class NautobotVirtualChassis(base.VirtualChassis):
 
     @classmethod
     def create(cls, adapter, ids, attrs):
-        """Create a VirtualChassis without a master - master is set by device creation."""
-        VirtualChassis.objects.get_or_create(name=ids["name"])
-        # Master will be set by SyncDevicesDevice.create() when the master device is created
-        return super().create(adapter, ids, attrs)
+        """Create VirtualChassis in Nautobot from VirtualChassis object.
+
+        The VirtualChassis is saved immediately so member Devices can reference it. The master is assigned in
+        `sync_complete()` once the member Devices have been created.
+        """
+        if adapter.job.debug:
+            adapter.job.logger.info(f"Creating VirtualChassis {ids['name']}.")
+        new_vc = VirtualChassis(name=ids["name"])
+        try:
+            new_vc.validated_save()
+        except ValidationError as err:
+            adapter.job.logger.warning(f"Unable to create VirtualChassis {ids['name']}. {err}")
+            return None
+        adapter.vc_map[ids["name"]] = new_vc.id
+        if attrs.get("master"):
+            adapter.objects_to_create["vc_masters"].append((new_vc.id, attrs["master"]))
+        return super().create(adapter=adapter, ids=ids, attrs=attrs)
+
+    def update(self, attrs):
+        """Update VirtualChassis in Nautobot from VirtualChassis object."""
+        if self.adapter.job.debug:
+            self.adapter.job.logger.info(f"Updating VirtualChassis {self.name} with {attrs}")
+        if "master" in attrs:
+            self.adapter.objects_to_create["vc_masters"].append((self.uuid, attrs["master"]))
+        return super().update(attrs)
+
+    def delete(self):
+        """Delete VirtualChassis in Nautobot from VirtualChassis object.
+
+        The VirtualChassis is deleted immediately, before Device updates, so its master can be removed from it.
+        """
+        if self.adapter.job.debug:
+            self.adapter.job.logger.info(f"Deleting VirtualChassis {self.name}.")
+        VirtualChassis.objects.get(id=self.uuid).delete()
+        super().delete()
+        return self
 
 
 class NautobotPort(base.Port):

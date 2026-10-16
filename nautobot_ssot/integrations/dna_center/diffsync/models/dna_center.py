@@ -81,12 +81,12 @@ class DnaCenterDevice(Device):
         return self
 
 
-class DnaVirtualChassis(VirtualChassis):
+class DnaCenterVirtualChassis(VirtualChassis):
     """DNA Center implementation of VirtualChassis DiffSync model."""
 
     @classmethod
     def create(cls, adapter, ids, attrs):
-        """Create VirtualChassis in DNA Center fromVirtualChassis object."""
+        """Create VirtualChassis in DNA Center from VirtualChassis object."""
         return super().create(adapter=adapter, ids=ids, attrs=attrs)
 
     def update(self, attrs):

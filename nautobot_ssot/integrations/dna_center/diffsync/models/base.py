@@ -79,7 +79,7 @@ class Device(DiffSyncModel):
         "tenant",
         "controller_group",
         "metadata",
-        "virtual_chassis__name",
+        "virtual_chassis",
         "vc_position",
         "vc_priority",
     )
@@ -99,9 +99,8 @@ class Device(DiffSyncModel):
     tenant: Optional[str] = None
     controller_group: str
     ports: Optional[List["Port"]] = []
-    virtual_chassis: Optional[str] = None
     metadata: Optional[bool] = True
-    virtual_chassis__name: Optional[str] = None
+    virtual_chassis: Optional[str] = None
     vc_position: Optional[int] = None
     vc_priority: Optional[int] = None
 
@@ -109,15 +108,15 @@ class Device(DiffSyncModel):
 
 
 class VirtualChassis(DiffSyncModel):
-    """Diffsync model for VirtualChassis."""
+    """DiffSync model for DNA Center switch stacks."""
 
-    _modelname = "virtualchassis"
+    _modelname = "virtual_chassis"
     _identifiers = ("name",)
-    _attributes = ("master__name",)
+    _attributes = ("master",)
     _children = {}
 
     name: str
-    master__name: Optional[str] = None
+    master: Optional[str] = None
 
     uuid: Optional[UUID] = None
 

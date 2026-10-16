@@ -15,6 +15,7 @@ from nautobot.dcim.models import Interface as OrmInterface
 from nautobot.dcim.models import Location as OrmLocation
 from nautobot.dcim.models import LocationType as OrmLocationType
 from nautobot.dcim.models import Platform
+from nautobot.dcim.models import VirtualChassis as OrmVirtualChassis
 from nautobot.extras.models import Status as OrmStatus
 from nautobot.extras.models.metadata import ObjectMetadata
 from nautobot.ipam.models import IPAddress as OrmIPAddress
@@ -65,6 +66,7 @@ class NautobotAdapter(Adapter):
     namespace_map = {}
     prefix_map = {}
     ipaddr_map = {}
+    vc_map = {}
 
     def __init__(self, *args, job, sync=None, tenant: Optional[OrmTenant] = None, **kwargs):
         """Initialize Nautobot.
@@ -172,36 +174,22 @@ class NautobotAdapter(Adapter):
                     f"Unable to load {self.job.building_loctype.name} {floor.parent.name} for {self.job.floor_loctype.name} {floor.name}. {err}"
                 )
 
-    def load_virtual_chassis(self, device):
-        """Add Nautobot Virtual Chassis objects as DiffSync."""
-        onboarding_vc = self.virtual_chassis(
-            name=device.virtual_chassis.name,
-            master__name=device.virtual_chassis.master.name if device.virtual_chassis.master_id else "",
-        )
-        for vc_member in device.virtual_chassis.members.all().exclude(
-            id=device.id
-        ):  # The originating device is loaded in load_devices
-            onboarding_device = self.device(
-                adapter=self,
-                model=vc_member.device_type.model,
-                location=vc_member.location.name,
-                name=vc_member.name,
-                platform=vc_member.platform.name if vc_member.platform_id else "",
-                # TODO: Figure out primary IP using other model
-                role=vc_member.role.name,
-                statu=vc_member.status.name,
-                # TODO: Figure out primary IP using other model
-                serial=vc_member.serial,
-                virtual_chassis__name=vc_member.virtual_chassis.name,
-                vc_position=vc_member.vc_position,
-                vc_priority=vc_member.vc_priority,
+    def load_virtual_chassis(self):
+        """Load VirtualChassis data from Nautobot into DiffSync models."""
+        if self.tenant:
+            stacks = OrmVirtualChassis.objects.filter(members__tenant=self.tenant)
+        else:
+            stacks = OrmVirtualChassis.objects.filter(members___custom_field_data__system_of_record="DNA Center")
+        for stack in stacks.distinct().select_related("master"):
+            self.vc_map[stack.name] = stack.id
+            new_vc = self.virtual_chassis(
+                name=stack.name,
+                master=stack.master.name if stack.master else None,
+                uuid=stack.id,
             )
-            self.add(onboarding_device)
-            if self.job.debug:
-                self.job.logger.debug(f"Device: {vc_member.name} loaded.")
-        self.add(onboarding_vc)
-        if self.job.debug:
-            self.job.logger.debug(f"Virtual Chassis: {onboarding_vc.name} loaded.")
+            if self.tenant:
+                new_vc.model_flags = DiffSyncModelFlags.SKIP_UNMATCHED_DST
+            self.add(new_vc)
 
     def load_devices(self):
         """Load Device data from Nautobot into DiffSync models."""
@@ -210,9 +198,6 @@ class NautobotAdapter(Adapter):
         else:
             devices = OrmDevice.objects.filter(_custom_field_data__system_of_record="DNA Center")
         for dev in devices:
-            if dev.virtual_chassis_id:
-                # TODO: How do I ensure no duplicate loading of chassis members that have already been loaded.
-                self.load_virtual_chassis(dev)
             self.device_map[dev.name] = dev.id
             version = None
             if getattr(dev, "software_version"):
@@ -241,6 +226,9 @@ class NautobotAdapter(Adapter):
                 controller_group=(
                     dev.controller_managed_device_group.name if dev.controller_managed_device_group else ""
                 ),
+                virtual_chassis=dev.virtual_chassis.name if dev.virtual_chassis else None,
+                vc_position=dev.vc_position,
+                vc_priority=dev.vc_priority,
                 uuid=dev.id,
             )
             if object_has_metadata(obj=dev, integration=self.job.data_source):
@@ -406,6 +394,7 @@ class NautobotAdapter(Adapter):
                     self.job.logger.warning(f"Unable to find Device ID {_dev[0]}. {err}")
                 except ValidationError as err:
                     self.job.logger.warning(f"Unable to save Device {dev.name}. {err}")
+        self.assign_vc_masters()
 
     def bulk_create_update(self):
         """Perform database update using bulk operations."""
@@ -437,6 +426,31 @@ class NautobotAdapter(Adapter):
                 dev.primary_ip6_id = d[1]
                 device_primary_ip_objs.append(dev)
             OrmDevice.objects.bulk_update(device_primary_ip_objs, ["primary_ip6_id"], batch_size=250)
+        self.assign_vc_masters()
+
+    def assign_vc_masters(self):
+        """Assign VirtualChassis masters once the member Devices have been created in Nautobot."""
+        if not self.objects_to_create["vc_masters"]:
+            return
+        self.job.logger.info("Performing assignment of VirtualChassis masters in Nautobot.")
+        for vc_id, master_name in self.objects_to_create["vc_masters"]:
+            try:
+                stack = OrmVirtualChassis.objects.get(id=vc_id)
+            except OrmVirtualChassis.DoesNotExist as err:
+                self.job.logger.warning(f"Unable to find VirtualChassis ID {vc_id}. {err}")
+                continue
+            if master_name and master_name not in self.device_map:
+                self.job.logger.warning(
+                    f"Unable to find Device {master_name} to assign as master of VirtualChassis {stack.name}."
+                )
+                continue
+            stack.master_id = self.device_map[master_name] if master_name else None
+            try:
+                stack.validated_save()
+            except ValidationError as err:
+                self.job.logger.warning(
+                    f"Unable to assign {master_name} as master of VirtualChassis {stack.name}. {err}"
+                )
 
     def load(self):
         """Load data from Nautobot into DiffSync models."""
@@ -451,6 +465,7 @@ class NautobotAdapter(Adapter):
         self.load_areas()
         self.load_buildings()
         self.load_floors()
+        self.load_virtual_chassis()
         self.load_devices()
         self.load_ports()
         self.load_prefixes()

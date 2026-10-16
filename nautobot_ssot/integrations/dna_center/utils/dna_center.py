@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import List
+from typing import List, Optional
 
 from dnacentersdk import api
 from dnacentersdk.exceptions import dnacentersdkException
@@ -11,6 +11,7 @@ from netutils.constants import BASE_INTERFACES
 from nautobot_ssot.integrations.dna_center.constants import BASE_INTERFACE_MAP
 
 LOGGER = logging.getLogger(__name__)
+STACK_MEMBER_PORT_RE = re.compile(r"^[A-Za-z-]+(\d+)/\d+/\d+")
 
 
 class DnaCenterClient:
@@ -119,14 +120,14 @@ class DnaCenterClient:
         """Retrieve stack information about Device from DNA Center.
 
         Args:
-            dev_id (str): ID of device in DNAC to query for details.
+            dev_id (str): ID of device in DNAC to query for stack details.
 
         Returns:
-            dict: Stack information about dev_id.
+            dict: Stack information about dev_id, including `stackSwitchInfo` for each stack member.
         """
         dev_stack = {}
-        try:  ## Need to verify the DNACenterSDK Call args and method name
-            dev_stack = self.conn.devices.get_stack_details(device_uuid=dev_id)["response"]
+        try:
+            dev_stack = self.conn.devices.get_stack_details_for_device(device_id=dev_id)["response"]
         except dnacentersdkException as err:
             LOGGER.error("Unable to get stack detail information from DNA Center. %s", err)
         return dev_stack
@@ -232,3 +233,18 @@ class DnaCenterClient:
             if len(model_list) == 1:
                 return model_list[0]
         return models
+
+    @staticmethod
+    def get_stack_member_number(port_name: str) -> Optional[int]:
+        """Determine which stack member a port belongs to from its name.
+
+        Args:
+            port_name (str): Name of the port, ie GigabitEthernet2/0/1.
+
+        Returns:
+            Optional[int]: Stack member number for the port or None if the port isn't tied to a stack member, ie Vlan1.
+        """
+        match = STACK_MEMBER_PORT_RE.match(port_name)
+        if match:
+            return int(match.group(1))
+        return None

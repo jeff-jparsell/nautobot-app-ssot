@@ -2,7 +2,7 @@
 
 import json
 from decimal import Decimal
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from diffsync import Adapter
 from diffsync.exceptions import ObjectNotFound
@@ -22,7 +22,7 @@ from nautobot_ssot.integrations.dna_center.diffsync.models.dna_center import (
     DnaCenterIPAddressonInterface,
     DnaCenterPort,
     DnaCenterPrefix,
-    DnaVirtualChassis,
+    DnaCenterVirtualChassis,
 )
 from nautobot_ssot.integrations.dna_center.utils.dna_center import DnaCenterClient
 from nautobot_ssot.utils import parse_hostname_for_role
@@ -39,7 +39,7 @@ class DnaCenterAdapter(Adapter):
     prefix = DnaCenterPrefix
     ipaddress = DnaCenterIPAddress
     ip_on_intf = DnaCenterIPAddressonInterface
-    virtual_chassis = DnaVirtualChassis
+    virtual_chassis = DnaCenterVirtualChassis
 
     top_level = ["area", "building", "virtual_chassis", "device", "prefix", "ipaddress", "ip_on_intf"]
 
@@ -346,21 +346,13 @@ class DnaCenterAdapter(Adapter):
                 f"Unable to find {self.job.building_loctype.name} {bldg_name} for {self.job.floor_loctype.name} {floor_name}. {err}"
             )
 
-    def load_virtual_chassis(self, *args):
-        """Load VirtualChassis device from DNA Center."""
-
-    def load_devices(self):
+    def load_devices(self):  # pylint: disable=too-many-branches
         """Load Device data from DNA Center info DiffSync models."""
         devices = self.conn.get_devices()
         for dev in devices:
-            deviceCount = 1
             dev_role = "Unknown"
             vendor = "Cisco"
             platform = self.get_device_platform(dev)
-            ## Device count for managing stacks
-            deviceCount += platform.count(",")
-            if deviceCount > 1:
-                stackDetails = self.conn.get_stack_detail(dev["id"])
             if not PLUGIN_CFG.get("dna_center_import_merakis") and platform == "cisco_meraki":
                 continue
             if platform == "unknown":
@@ -418,74 +410,183 @@ class DnaCenterAdapter(Adapter):
                 self.failed_import_devices.append(dev)
                 continue
             self.load_device_location_tree(dev_details, loc_data)
-            # Hook into this, if I > 1 then call dnac stack_details, utilize s/n from there to append M{I}.
-            # Master should get all stack unique interfaces, otherwise interfaces get associated with their stack
-            for i in range(deviceCount):
-                if deviceCount > 1:
-                    dHostname = dev["hostname"] + f":M{i + 1}" if dev.get("hostname") else dev["id"] + f":M{i + 1}"
-                    dSerialNumber = stackDetails["stackSwitchInfo"][i]["serialNumber"]
-                    dPlatform = stackDetails["stackSwitchInfo"][i]["platformId"]
-                else:
-                    dHostname = dev["hostname"] if dev.get("hostname") else dev["id"]
-                    dSerialNumber = dev.get("serialNumber", "")
-                    dPlatform = dev.get("platformId", "")
-                try:
-                    if self.job.debug:
-                        self.job.logger.info(f"Loading device {dHostname}. {dev}")
-                    device_found = self.get(self.device, dHostname)
-                    if device_found:
-                        if self.job.debug:
-                            self.job.logger.warning(
-                                f"Duplicate device attempting to be loaded for {dHostname} with ID: {dev['id']} so will not be imported."
-                            )
-                        dev["field_validation"] = {
-                            "reason": "Failed due to duplicate device found.",
-                            "device_details": dev_details,
-                            "location_data": loc_data,
-                        }
-                        self.failed_import_devices.append(dev)
-                        continue
-                except ObjectNotFound:
-                    location_ids = dev_details["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
-                    floor_name = None
-                    if loc_data.get("floor"):
-                        floor_name = self.dnac_location_map[location_ids[-1]]["name"]
-                        if loc_data["building"] not in loc_data["floor"]:
-                            bldg_name = self.dnac_location_map[location_ids[-1]]["parent"]
-                            floor_name = f"{bldg_name} - {floor_name}"
-                        location_ids.pop(-1)
-                    building_name = self.dnac_location_map[location_ids[-1]]["name"]
-                    area_name = self.dnac_location_map[location_ids[-1]]["parent"]
-                    new_dev = self.device(
-                        name=dHostname,
-                        status="Active" if dev.get("reachabilityStatus") != "Unreachable" else "Offline",
-                        role=dev_role,
-                        vendor=vendor,
-                        model=self.conn.get_model_name(models=dev["platformId"])
-                        if dev.get("platformId")
-                        else "Unknown",
-                        area=area_name,
-                        site=building_name,
-                        floor=floor_name,
-                        serial=dSerialNumber,
-                        version=dev.get("softwareVersion"),
-                        platform=platform,  ## TODO: change -- this is stinky because I may need to re-run get_device_platform
-                        tenant=self.tenant.name if self.tenant else None,
-                        controller_group=self.job.controller_group.name,
-                        uuid=None,
-                    )
-                    try:
-                        self.add(new_dev)
-                        self.load_ports(device_id=dev["id"], dev=new_dev, mgmt_addr=dev["managementIpAddress"])
-                    except ValidationError as err:
-                        if self.job.debug:
-                            self.job.logger.warning(f"Unable to load device {dev['hostname']}. {err}")
-                        dev["field_validation"] = {
-                            "reason": f"Failed validation. {err}",
-                            "device_details": dev_details,
-                            "location_data": loc_data,
-                        }
-                        self.failed_import_devices.append(dev)
+            area_name, building_name, floor_name = self.get_device_location_names(dev_details, loc_data)
+            dev_attrs = {
+                "status": "Active" if dev.get("reachabilityStatus") != "Unreachable" else "Offline",
+                "role": dev_role,
+                "vendor": vendor,
+                "area": area_name,
+                "site": building_name,
+                "floor": floor_name,
+                "version": dev.get("softwareVersion"),
+                "platform": platform,
+                "tenant": self.tenant.name if self.tenant else None,
+                "controller_group": self.job.controller_group.name,
+            }
+            if self.is_stack(dev) and self.load_virtual_chassis(
+                dev=dev, dev_attrs=dev_attrs, dev_details=dev_details, loc_data=loc_data
+            ):
+                continue
+            new_dev = self.load_device(
+                dev=dev,
+                dev_attrs={
+                    **dev_attrs,
+                    "name": dev["hostname"],
+                    "serial": dev["serialNumber"] if dev.get("serialNumber") else "",
+                    "model": self.conn.get_model_name(models=dev["platformId"]) if dev.get("platformId") else "Unknown",
+                },
+                dev_details=dev_details,
+                loc_data=loc_data,
+            )
+            if new_dev:
+                self.load_ports(device_id=dev["id"], dev=new_dev, mgmt_addr=dev["managementIpAddress"])
+
+    def load_device(self, dev: dict, dev_attrs: dict, dev_details: dict, loc_data: dict) -> Optional[DnaCenterDevice]:
+        """Load a single Device from DNA Center into DiffSync model.
+
+        Args:
+            dev (dict): Dictionary of information about Device from DNA Center.
+            dev_attrs (dict): Attributes for the DnaCenterDevice to be loaded, including name.
+            dev_details (dict): Device details from DNA Center.
+            loc_data (dict): Location data for the Device.
+
+        Returns:
+            Optional[DnaCenterDevice]: Loaded Device or None if the Device was unable to be loaded.
+        """
+        dev_name = dev_attrs["name"]
+        try:
+            if self.job.debug:
+                self.job.logger.info(f"Loading device {dev_name}. {dev}")
+            self.get(self.device, dev_name)
+            if self.job.debug:
+                self.job.logger.warning(
+                    f"Duplicate device attempting to be loaded for {dev_name} with ID: {dev['id']} so will not be imported."
+                )
+            dev["field_validation"] = {
+                "reason": "Failed due to duplicate device found.",
+                "device_details": dev_details,
+                "location_data": loc_data,
+            }
+            self.failed_import_devices.append(dev)
+            return None
+        except ObjectNotFound:
+            pass
+        new_dev = self.device(**dev_attrs, uuid=None)
+        try:
+            self.add(new_dev)
+        except ValidationError as err:
+            if self.job.debug:
+                self.job.logger.warning(f"Unable to load device {dev_name}. {err}")
+            dev["field_validation"] = {
+                "reason": f"Failed validation. {err}",
+                "device_details": dev_details,
+                "location_data": loc_data,
+            }
+            self.failed_import_devices.append(dev)
+            return None
+        return new_dev
+
+    def load_virtual_chassis(self, dev: dict, dev_attrs: dict, dev_details: dict, loc_data: dict) -> bool:
+        """Load a switch stack from DNA Center as a VirtualChassis with a Device for each stack member.
+
+        The lowest numbered stack member keeps the DNA Center hostname so the Device name stays the same across
+        stack failovers. The remaining members are named `<hostname>:<member number>`. The VirtualChassis master is
+        the stack member with the ACTIVE role.
+
+        Args:
+            dev (dict): Dictionary of information about the stack from DNA Center.
+            dev_attrs (dict): Device attributes shared by all stack members.
+            dev_details (dict): Device details for the stack from DNA Center.
+            loc_data (dict): Location data for the stack.
+
+        Returns:
+            bool: Whether the stack was handled. False when stack details are unavailable so it should be loaded as a single Device.
+        """
+        stack_details = self.conn.get_stack_detail(dev_id=dev["id"])
+        members = sorted(
+            (stack_details or {}).get("stackSwitchInfo") or [], key=lambda member: member["stackMemberNumber"]
+        )
+        if not members:
+            self.job.logger.warning(
+                f"Unable to retrieve stack details for {dev['hostname']} so it will be loaded as a single Device."
+            )
+            return False
+        first_member = members[0]["stackMemberNumber"]
+        active_member = next(
+            (member["stackMemberNumber"] for member in members if member.get("role") == "ACTIVE"), first_member
+        )
+        stack_members = {}
+        for member in members:
+            member_num = member["stackMemberNumber"]
+            new_dev = self.load_device(
+                dev=dev,
+                dev_attrs={
+                    **dev_attrs,
+                    "name": dev["hostname"] if member_num == first_member else f"{dev['hostname']}:{member_num}",
+                    "serial": member.get("serialNumber") or "",
+                    "model": member.get("platformId") or "Unknown",
+                    "virtual_chassis": dev["hostname"],
+                    "vc_position": member_num,
+                    "vc_priority": member.get("switchPriority"),
+                },
+                dev_details=dev_details,
+                loc_data=loc_data,
+            )
+            if not new_dev:
+                if member_num == first_member:
+                    # Device with the stack hostname already exists so don't load the rest of the stack.
+                    return True
+                continue
+            stack_members[member_num] = new_dev
+        master = stack_members.get(active_member, stack_members[first_member])
+        self.get_or_instantiate(
+            self.virtual_chassis,
+            ids={"name": dev["hostname"]},
+            attrs={"master": master.name, "uuid": None},
+        )
+        self.load_ports(
+            device_id=dev["id"],
+            dev=stack_members[first_member],
+            mgmt_addr=dev["managementIpAddress"],
+            stack_members=stack_members,
+        )
+        return True
+
+    @staticmethod
+    def is_stack(dev: dict) -> bool:
+        """Determine whether a Device from DNA Center is a switch stack.
+
+        DNA Center returns a stack as a single Device with the platformId and serialNumber of each member joined by commas.
+
+        Args:
+            dev (dict): Dictionary of information about Device from DNA Center.
+
+        Returns:
+            bool: Whether the Device is a switch stack.
+        """
+        return any("," in (dev.get(field) or "") for field in ("platformId", "serialNumber"))
+
+    def get_device_location_names(self, dev_details: dict, loc_data: dict) -> Tuple[str, str, Optional[str]]:
+        """Determine the Area, Building, and Floor names for a Device from DNA Center.
+
+        Args:
+            dev_details (dict): Dictionary of Device information.
+            loc_data (dict): Location data for the Device.
+
+        Returns:
+            Tuple[str, str, Optional[str]]: Area, Building, and Floor names for the Device. Floor is None if the Device isn't on a Floor.
+        """
+        location_ids = dev_details["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
+        floor_name = None
+        if loc_data.get("floor"):
+            floor_name = self.dnac_location_map[location_ids[-1]]["name"]
+            if loc_data["building"] not in loc_data["floor"]:
+                bldg_name = self.dnac_location_map[location_ids[-1]]["parent"]
+                floor_name = f"{bldg_name} - {floor_name}"
+            location_ids.pop(-1)
+        building_name = self.dnac_location_map[location_ids[-1]]["name"]
+        area_name = self.dnac_location_map[location_ids[-1]]["parent"]
+        return area_name, building_name, floor_name
 
     def load_device_location_tree(self, dev_details: dict, loc_data: dict):
         """Load Device locations into DiffSync models for Floor, Building, and Areas.
@@ -575,23 +676,34 @@ class DnaCenterAdapter(Adapter):
                 platform = "cisco_meraki"
         return platform
 
-    def load_ports(self, device_id: str, dev: DnaCenterDevice, mgmt_addr: str = ""):
+    def load_ports(
+        self,
+        device_id: str,
+        dev: DnaCenterDevice,
+        mgmt_addr: str = "",
+        stack_members: Optional[Dict[int, DnaCenterDevice]] = None,
+    ):
         """Load port info from DNAC into Port DiffSyncModel.
 
         Args:
             device_id (str): ID for Device in DNAC to retrieve ports for.
             dev (DnaCenterDevice): Device associated with ports.
             mgmt_addr (str): Management IP address for device.
+            stack_members (Dict[int, DnaCenterDevice], optional): Stack member number to Device mapping for a switch stack.
+                Ports are assigned to the stack member in the port name, ie GigabitEthernet2/0/1, and all others to `dev`.
         """
         ports = self.conn.get_port_info(device_id=device_id)
         for port in ports:
+            port_dev = dev
+            if stack_members:
+                port_dev = stack_members.get(self.conn.get_stack_member_number(port_name=port["portName"]), dev)
             port_type = self.conn.get_port_type(port_info=port)
             port_status = self.conn.get_port_status(port_info=port)
             new_port, loaded = self.get_or_instantiate(
                 self.port,
                 ids={
                     "name": port["portName"],
-                    "device": dev.name,
+                    "device": port_dev.name,
                 },
                 attrs={
                     "description": port["description"],
@@ -606,8 +718,8 @@ class DnaCenterAdapter(Adapter):
             )
             if loaded:
                 if self.job.debug:
-                    self.job.logger.info(f"Loaded port {port['portName']} for {dev.name}. {port}")
-                dev.add_child(new_port)
+                    self.job.logger.info(f"Loaded port {port['portName']} for {port_dev.name}. {port}")
+                port_dev.add_child(new_port)
                 if port.get("addresses"):
                     for addr in port["addresses"]:
                         host = addr["address"]["ipAddress"]["address"]
@@ -621,12 +733,14 @@ class DnaCenterAdapter(Adapter):
                         )
                         self.load_ipaddress_to_interface(
                             host=host,
-                            device=dev.name if dev.name else "",
+                            device=port_dev.name if port_dev.name else "",
                             port=port["portName"],
                             primary=primary,
                         )
             else:
-                self.job.logger.warning(f"Duplicate port attempting to be loaded, {port['portName']} for {dev.name}")
+                self.job.logger.warning(
+                    f"Duplicate port attempting to be loaded, {port['portName']} for {port_dev.name}"
+                )
 
     def load_ip_address(self, host: str, mask_length: int, prefix: str):
         """Load IP Address info from DNAC into IPAddress DiffSyncModel.

@@ -123,6 +123,7 @@ class DnaCenterDataSource(DataSource):  # pylint: disable=too-many-instance-attr
             DataMapping("Devices", None, "Devices", reverse("dcim:device_list")),
             DataMapping("Interfaces", None, "Interfaces", reverse("dcim:interface_list")),
             DataMapping("IP Addresses", None, "IP Addresses", reverse("ipam:ipaddress_list")),
+            DataMapping("Stacks", None, "Virtual Chassis", reverse("dcim:virtualchassis_list")),
         )
 
     def load_source_adapter(self):
