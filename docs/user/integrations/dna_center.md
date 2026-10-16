@@ -10,6 +10,7 @@ From Cisco DNA Center into Nautobot, it synchronizes the following objects:
 | Buildings               | Location*                    |
 | Floors                  | Location*                    |
 | Devices                 | Devices**                    |
+| Switch Stacks           | Virtual Chassis***           |
 | Ports                   | Interfaces                   |
 | Prefixes                | Prefixes                     |
 | IP Addresses            | IP Addresses                 |
@@ -17,6 +18,8 @@ From Cisco DNA Center into Nautobot, it synchronizes the following objects:
 `*` As of SSoT 3.2.0 the LocationType for Areas, Buildings, and Floors can be defined in the Job form. Prior to SSoT 3.2.0 the DNA Center integration creates a Region, Site, and Floor LocationType and imports Areas as Region Locations, Buildings as Site Locations, and Floors as Floor Locations.
 
 `**` If the [Device Lifecycle Nautobot app](https://github.com/nautobot/nautobot-app-device-lifecycle-mgmt) is found to be installed, a matching Version will be created with a RelationshipAssociation connecting the Device and that Version.
+
+`***` Switch stacks are imported as a Virtual Chassis with a Device for each stack member. See [Switch Stacks](#switch-stacks) for more information.
 
 > Starting in SSoT 3.5.0, the imported Locations, Devices, Prefixes, and IPAddresses will have a [Object Metadata](https://docs.nautobot.com/projects/core/en/stable/user-guide/platform-functionality/objectmetadata/) created or updated to track the last update from DNA Center.
 
@@ -105,3 +108,15 @@ Running this Job will redirect you to a `Nautobot Job Result` view.
 Once the Job has finished you can click on the `SSoT Sync Details` button at the top right of the Job Result page to see detailed information about the data that was synchronized from DNA Center and the outcome of the sync Job.
 
 ![SSoT Sync Details](../../images/dnac_ssot-sync-details.png)
+
+### Switch Stacks
+
+DNA Center returns a switch stack as a single Device with the serial numbers and platform IDs of each stack member joined by commas. When the integration finds one of these Devices it retrieves the stack details from DNA Center and imports the stack as a native Nautobot Virtual Chassis:
+
+- The Virtual Chassis is named after the stack hostname in DNA Center.
+- A Device is created for each stack member with that member's serial number and model. The lowest numbered stack member keeps the stack hostname, ie `san-floor1-sw02`, and the remaining members are named `<hostname>:<member number>`, ie `san-floor1-sw02:2`. Device names are tied to the stack member number so they don't change when the stack fails over.
+- Each member's Virtual Chassis position is its stack member number and its priority is the stack member's switch priority.
+- The Virtual Chassis master is the stack member with the `ACTIVE` role in DNA Center.
+- Interfaces are assigned to the stack member identified in the interface name, ie `GigabitEthernet2/0/1` is assigned to stack member 2. Interfaces without a stack member number, such as SVIs, Loopbacks, Port-channels, and the management interface, are assigned to the Device named after the stack hostname along with the management IP address.
+
+If the stack details can't be retrieved from DNA Center the stack is imported as a single Device. StackWise Virtual pairs aren't imported as a Virtual Chassis yet.
