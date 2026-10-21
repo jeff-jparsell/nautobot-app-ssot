@@ -126,7 +126,7 @@ class DnaCenterClient:
             dict: Stack information about dev_id, including `stackSwitchInfo` for each stack member.
         """
         dev_stack = {}
-        try:
+        try:  ## Need to verify the DNACenterSDK Call args and method name
             dev_stack = self.conn.devices.get_stack_details_for_device(device_id=dev_id)["response"]
         except dnacentersdkException as err:
             LOGGER.error("Unable to get stack detail information from DNA Center. %s", err)
