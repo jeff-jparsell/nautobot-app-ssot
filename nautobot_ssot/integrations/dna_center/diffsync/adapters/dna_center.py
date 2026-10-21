@@ -369,9 +369,6 @@ class DnaCenterAdapter(Adapter):
             except ValidationError as err:
                 if self.job.debug:
                     self.job.logger.warning(f"Unable to load device {hostname}. {err}")
-                newChassis["field_validation"] = {
-                    "reason": f"Failed validation. {err}",
-                }
                 self.failed_import_devices.append(newChassis)
         return
 
