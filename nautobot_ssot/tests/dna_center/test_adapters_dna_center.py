@@ -343,7 +343,7 @@ class TestDnaCenterAdapterTestCase(TransactionTestCase):  # pylint: disable=too-
         ]
         self.dna_center_client.get_devices.return_value = device_fixture_no_hostname
         self.dna_center.load_devices()
-        self.dna_center.job.logger.warning.assert_called_with("Device 12345 is missing hostname so will be skipped.")
+        self.dna_center.job.logger.warning.assert_called_with("Device 12345 is missing a hostname, and will be skipped")
         self.assertEqual(len(self.dna_center.get_all("device")), 0)
 
     def test_load_ports(self):

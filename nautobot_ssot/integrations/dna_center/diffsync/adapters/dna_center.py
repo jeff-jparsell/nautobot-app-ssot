@@ -2,7 +2,7 @@
 
 import json
 from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from diffsync import Adapter
 from diffsync.exceptions import ObjectNotFound
@@ -34,7 +34,6 @@ class DnaCenterAdapter(Adapter):
     area = DnaCenterArea
     building = DnaCenterBuilding
     floor = DnaCenterFloor
-    chassis = DnaVirtualChassis
     device = DnaCenterDevice
     port = DnaCenterPort
     prefix = DnaCenterPrefix
@@ -352,7 +351,7 @@ class DnaCenterAdapter(Adapter):
         try:
             if self.job.debug:
                 self.job.logger.info(f"Loading VirtualChassis {hostname}")
-            virtualChassis = self.get(self.chassis, hostname) ## Where does self.x come from here?
+            virtualChassis = self.get(self.virtual_chassis, hostname) ## Where does self.x come from here?
             if virtualChassis:
                 if self.job.debug:
                     self.job.logger.warning(
@@ -409,186 +408,6 @@ class DnaCenterAdapter(Adapter):
                 }
                 self.failed_import_devices.append(device)
                 continue
-<<<<<<< HEAD
-            self.load_device_location_tree(dev_details, loc_data)
-            area_name, building_name, floor_name = self.get_device_location_names(dev_details, loc_data)
-            dev_attrs = {
-                "status": "Active" if dev.get("reachabilityStatus") != "Unreachable" else "Offline",
-                "role": dev_role,
-                "vendor": vendor,
-                "area": area_name,
-                "site": building_name,
-                "floor": floor_name,
-                "version": dev.get("softwareVersion"),
-                "platform": platform,
-                "tenant": self.tenant.name if self.tenant else None,
-                "controller_group": self.job.controller_group.name,
-            }
-            if self.is_stack(dev) and self.load_virtual_chassis(
-                dev=dev, dev_attrs=dev_attrs, dev_details=dev_details, loc_data=loc_data
-            ):
-                continue
-            new_dev = self.load_device(
-                dev=dev,
-                dev_attrs={
-                    **dev_attrs,
-                    "name": dev["hostname"],
-                    "serial": dev["serialNumber"] if dev.get("serialNumber") else "",
-                    "model": self.conn.get_model_name(models=dev["platformId"]) if dev.get("platformId") else "Unknown",
-                },
-                dev_details=dev_details,
-                loc_data=loc_data,
-            )
-            if new_dev:
-                self.load_ports(device_id=dev["id"], dev=new_dev, mgmt_addr=dev["managementIpAddress"])
-
-    def load_device(self, dev: dict, dev_attrs: dict, dev_details: dict, loc_data: dict) -> Optional[DnaCenterDevice]:
-        """Load a single Device from DNA Center into DiffSync model.
-
-        Args:
-            dev (dict): Dictionary of information about Device from DNA Center.
-            dev_attrs (dict): Attributes for the DnaCenterDevice to be loaded, including name.
-            dev_details (dict): Device details from DNA Center.
-            loc_data (dict): Location data for the Device.
-
-        Returns:
-            Optional[DnaCenterDevice]: Loaded Device or None if the Device was unable to be loaded.
-        """
-        dev_name = dev_attrs["name"]
-        try:
-            if self.job.debug:
-                self.job.logger.info(f"Loading device {dev_name}. {dev}")
-            self.get(self.device, dev_name)
-            if self.job.debug:
-                self.job.logger.warning(
-                    f"Duplicate device attempting to be loaded for {dev_name} with ID: {dev['id']} so will not be imported."
-                )
-            dev["field_validation"] = {
-                "reason": "Failed due to duplicate device found.",
-                "device_details": dev_details,
-                "location_data": loc_data,
-            }
-            self.failed_import_devices.append(dev)
-            return None
-        except ObjectNotFound:
-            pass
-        new_dev = self.device(**dev_attrs, uuid=None)
-        try:
-            self.add(new_dev)
-        except ValidationError as err:
-            if self.job.debug:
-                self.job.logger.warning(f"Unable to load device {dev_name}. {err}")
-            dev["field_validation"] = {
-                "reason": f"Failed validation. {err}",
-                "device_details": dev_details,
-                "location_data": loc_data,
-            }
-            self.failed_import_devices.append(dev)
-            return None
-        return new_dev
-
-    def load_virtual_chassis(self, dev: dict, dev_attrs: dict, dev_details: dict, loc_data: dict) -> bool:
-        """Load a switch stack from DNA Center as a VirtualChassis with a Device for each stack member.
-
-        The lowest numbered stack member keeps the DNA Center hostname so the Device name stays the same across
-        stack failovers. The remaining members are named `<hostname>:<member number>`. The VirtualChassis master is
-        the stack member with the ACTIVE role.
-
-        Args:
-            dev (dict): Dictionary of information about the stack from DNA Center.
-            dev_attrs (dict): Device attributes shared by all stack members.
-            dev_details (dict): Device details for the stack from DNA Center.
-            loc_data (dict): Location data for the stack.
-
-        Returns:
-            bool: Whether the stack was handled. False when stack details are unavailable so it should be loaded as a single Device.
-        """
-        stack_details = self.conn.get_stack_detail(dev_id=dev["id"])
-        members = sorted(
-            (stack_details or {}).get("stackSwitchInfo") or [], key=lambda member: member["stackMemberNumber"]
-        )
-        if not members:
-            self.job.logger.warning(
-                f"Unable to retrieve stack details for {dev['hostname']} so it will be loaded as a single Device."
-            )
-            return False
-        first_member = members[0]["stackMemberNumber"]
-        active_member = next(
-            (member["stackMemberNumber"] for member in members if member.get("role") == "ACTIVE"), first_member
-        )
-        stack_members = {}
-        for member in members:
-            member_num = member["stackMemberNumber"]
-            new_dev = self.load_device(
-                dev=dev,
-                dev_attrs={
-                    **dev_attrs,
-                    "name": dev["hostname"] if member_num == first_member else f"{dev['hostname']}:{member_num}",
-                    "serial": member.get("serialNumber") or "",
-                    "model": member.get("platformId") or "Unknown",
-                    "virtual_chassis": dev["hostname"],
-                    "vc_position": member_num,
-                    "vc_priority": member.get("switchPriority"),
-                },
-                dev_details=dev_details,
-                loc_data=loc_data,
-            )
-            if not new_dev:
-                if member_num == first_member:
-                    # Device with the stack hostname already exists so don't load the rest of the stack.
-                    return True
-                continue
-            stack_members[member_num] = new_dev
-        master = stack_members.get(active_member, stack_members[first_member])
-        self.get_or_instantiate(
-            self.virtual_chassis,
-            ids={"name": dev["hostname"]},
-            attrs={"master": master.name, "uuid": None},
-        )
-        self.load_ports(
-            device_id=dev["id"],
-            dev=stack_members[first_member],
-            mgmt_addr=dev["managementIpAddress"],
-            stack_members=stack_members,
-        )
-        return True
-
-    @staticmethod
-    def is_stack(dev: dict) -> bool:
-        """Determine whether a Device from DNA Center is a switch stack.
-
-        DNA Center returns a stack as a single Device with the platformId and serialNumber of each member joined by commas.
-
-        Args:
-            dev (dict): Dictionary of information about Device from DNA Center.
-
-        Returns:
-            bool: Whether the Device is a switch stack.
-        """
-        return any("," in (dev.get(field) or "") for field in ("platformId", "serialNumber"))
-
-    def get_device_location_names(self, dev_details: dict, loc_data: dict) -> Tuple[str, str, Optional[str]]:
-        """Determine the Area, Building, and Floor names for a Device from DNA Center.
-
-        Args:
-            dev_details (dict): Dictionary of Device information.
-            loc_data (dict): Location data for the Device.
-
-        Returns:
-            Tuple[str, str, Optional[str]]: Area, Building, and Floor names for the Device. Floor is None if the Device isn't on a Floor.
-        """
-        location_ids = dev_details["siteHierarchyGraphId"].lstrip("/").rstrip("/").split("/")
-        floor_name = None
-        if loc_data.get("floor"):
-            floor_name = self.dnac_location_map[location_ids[-1]]["name"]
-            if loc_data["building"] not in loc_data["floor"]:
-                bldg_name = self.dnac_location_map[location_ids[-1]]["parent"]
-                floor_name = f"{bldg_name} - {floor_name}"
-            location_ids.pop(-1)
-        building_name = self.dnac_location_map[location_ids[-1]]["name"]
-        area_name = self.dnac_location_map[location_ids[-1]]["parent"]
-        return area_name, building_name, floor_name
-=======
             locations_data = self.conn.parse_site_hierarchy(
                 location_map=self.dnac_location_map,
                 site_hier=deviceDetails["siteHierarchyGraphId"]
@@ -606,7 +425,7 @@ class DnaCenterAdapter(Adapter):
             self.load_device_location_tree(deviceDetails, locations_data)
 
             # Patch up device information
-            deviceRole = self.get_device_role(device["role"])
+            deviceRole = self.get_device_role(device)
             deviceVendor = "Juniper" if "Juniper" in device["type"] else "Cisco"
             deviceStatus = "Active" if device["reachabilityStatus"] != "Unreachable" else "Offline"
 
@@ -629,7 +448,7 @@ class DnaCenterAdapter(Adapter):
                     deviceHostname = device["hostname"]
                     deviceSerial = device["serialNumber"]
                     deviceModel = device["platformId"]
-                    devicePlatform = self.get_device_platform(device["platformId"])
+                    devicePlatform = self.get_device_platform(device)
                     deviceChassis = None
                     deviceChassisPosition = None
                     deviceChassisPriority = None
@@ -693,7 +512,6 @@ class DnaCenterAdapter(Adapter):
                             "location_data": locations_data,
                         }
                         self.failed_import_devices.append(device)
->>>>>>> jp_support_stack_switches
 
     def load_device_location_tree(self, dev_details: dict, loc_data: dict):
         """Load Device locations into DiffSync models for Floor, Building, and Areas.
